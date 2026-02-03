@@ -40,7 +40,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
     weaver: Callable[[dict], Any] | None = None
     client_name: str | None = None
     hostname: str | None = None
-    api_key: str | None = None
+
+    # Headers to forward from incoming request (SDK → Anthropic)
+    # These handle authentication - DO NOT add our own API keys!
+    FORWARD_HEADERS = [
+        "authorization",      # OAuth Bearer token (Claude Max)
+        "x-api-key",          # API key auth (fallback)
+        "anthropic-version",
+        "anthropic-beta",
+        "content-type",
+    ]
 
     def log_message(self, format, *args):
         """Suppress default logging."""
@@ -65,34 +74,44 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 finally:
                     loop.close()
 
-            # Build headers for Anthropic
-            headers = {
-                "Content-Type": "application/json",
-                "anthropic-version": self.headers.get("anthropic-version", "2023-06-01"),
-                "x-api-key": self.api_key or os.environ.get("ANTHROPIC_API_KEY", ""),
-            }
+            # Forward headers from SDK - let SDK handle auth!
+            # DO NOT inject our own API keys
+            headers = {}
+            for header_name in self.FORWARD_HEADERS:
+                value = self.headers.get(header_name)
+                if value:
+                    headers[header_name] = value
 
-            # Copy authorization header if present (for OAuth)
-            if self.headers.get("Authorization"):
-                headers["Authorization"] = self.headers["Authorization"]
+            # Ensure we have content-type
+            if "content-type" not in headers:
+                headers["content-type"] = "application/json"
 
-            # Forward to Anthropic
-            # Use sync httpx for simplicity in the handler
+            # Forward to Anthropic with STREAMING
+            # Use stream() to avoid buffering the entire response
             with httpx.Client(timeout=300.0) as client:
-                response = client.post(
+                with client.stream(
+                    "POST",
                     f"{ANTHROPIC_API_URL}{self.path}",
                     json=body,
                     headers=headers,
-                    # Don't follow redirects, stream response
-                )
+                ) as response:
+                    # Send response status and headers immediately
+                    self.send_response(response.status_code)
+                    for key, value in response.headers.items():
+                        # Skip hop-by-hop headers
+                        if key.lower() not in (
+                            "content-encoding",
+                            "transfer-encoding",
+                            "connection",
+                            "keep-alive",
+                        ):
+                            self.send_header(key, value)
+                    self.end_headers()
 
-            # Send response back
-            self.send_response(response.status_code)
-            for key, value in response.headers.items():
-                if key.lower() not in ("content-encoding", "transfer-encoding", "connection"):
-                    self.send_header(key, value)
-            self.end_headers()
-            self.wfile.write(response.content)
+                    # Stream response body chunk by chunk
+                    for chunk in response.iter_bytes():
+                        self.wfile.write(chunk)
+                        self.wfile.flush()  # Critical for real-time streaming!
 
         except Exception as e:
             logger.error(f"Proxy error: {e}")
@@ -141,7 +160,6 @@ class AlphaProxy:
                 "weaver": staticmethod(self.weaver),
                 "client_name": self.client,
                 "hostname": self.hostname,
-                "api_key": os.environ.get("ANTHROPIC_API_KEY"),
             },
         )
 
