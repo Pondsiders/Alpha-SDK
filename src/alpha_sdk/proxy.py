@@ -113,9 +113,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         self.wfile.write(chunk)
                         self.wfile.flush()  # Critical for real-time streaming!
 
+        except BrokenPipeError:
+            # Client disconnected mid-stream (normal for count_tokens, etc.)
+            pass
         except Exception as e:
             logger.error(f"Proxy error: {e}")
-            self.send_error(500, str(e))
+            try:
+                self.send_error(500, str(e))
+            except BrokenPipeError:
+                pass  # Client already gone
 
     def do_GET(self):
         """Handle GET requests (health check, etc.)."""

@@ -18,9 +18,9 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     AssistantMessage,
     ResultMessage,
-    StreamEvent,
     TextBlock,
 )
+from claude_agent_sdk.types import StreamEvent
 
 from .proxy import AlphaProxy
 from .weave import weave
