@@ -1,8 +1,12 @@
-"""alpha_sdk - Everything that turns Claude into Alpha."""
+"""alpha_sdk - Everything that turns Claude into Alpha.
+
+Proxyless architecture:
+- System prompt (soul) passed directly to Claude Agent SDK
+- Orientation (context) injected in first user message
+- No proxy, no canary, no interception
+"""
 
 from .client import AlphaClient, PermissionMode
-from .weave import weave
-from .proxy import AlphaProxy
 from .observability import configure as configure_observability
 from .sessions import SessionInfo, list_sessions, get_session_path, get_sessions_dir
 
@@ -15,9 +19,7 @@ __all__ = [
     "list_sessions",
     "get_session_path",
     "get_sessions_dir",
-    # Lower-level components
-    "AlphaProxy",
-    "weave",
+    # Observability
     "configure_observability",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"  # Proxyless architecture

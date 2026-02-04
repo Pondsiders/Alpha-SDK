@@ -1,12 +1,10 @@
 """AlphaClient - the main interface to Alpha.
 
-Wraps Claude Agent SDK with:
-- Automatic proxy setup for request transformation
-- Long-lived client with session switching
-- Memory recall before prompts
-- Memorables extraction after turns
-- Session discovery and management
-- Transport bypass for structured input (canary + memories)
+Proxyless architecture:
+- System prompt is assembled once at connect() and passed to SDK
+- Orientation (capsules, letter, here, context, etc.) goes in first user message
+- Memories and memorables go in user content, not system prompt
+- No proxy, no canary, no interception
 """
 
 import asyncio
@@ -15,6 +13,7 @@ import os
 from typing import Any, AsyncGenerator, AsyncIterable, Literal
 
 import logfire
+import redis.asyncio as aioredis
 
 # Permission modes supported by Claude Agent SDK
 PermissionMode = Literal[
@@ -31,42 +30,101 @@ from claude_agent_sdk import (
     ResultMessage,
     TextBlock,
 )
-from claude_agent_sdk.types import StreamEvent
+from claude_agent_sdk.types import StreamEvent, HookMatcher, PreCompactHookInput, HookContext
 
-from .proxy import AlphaProxy
 from .memories.recall import recall
 from .memories.suggest import suggest
 from .sessions import list_sessions, get_session_path, get_sessions_dir, SessionInfo
-from .envelope import build_envelope, build_user_message
 from .system_prompt import assemble
+from .system_prompt.soul import get_soul
+
+# Redis URL for memorables
+REDIS_URL = os.environ.get("REDIS_URL", "redis://alpha-pi:6379")
+
+
+def _format_memory(memory: dict) -> str:
+    """Format a memory for inclusion in user content.
+
+    Creates human-readable memory text with relative timestamps.
+    """
+    import pendulum
+
+    mem_id = memory.get("id", "?")
+    created_at = memory.get("created_at", "")
+    content = memory.get("content", "").strip()
+    score = memory.get("score")
+
+    # Simple relative time formatting
+    relative_time = created_at  # fallback
+    try:
+        dt = pendulum.parse(created_at)
+        now = pendulum.now(dt.timezone or "America/Los_Angeles")
+        diff = now.diff(dt)
+        if diff.in_days() == 0:
+            relative_time = f"today at {dt.format('h:mm A')}"
+        elif diff.in_days() == 1:
+            relative_time = f"yesterday at {dt.format('h:mm A')}"
+        elif diff.in_days() < 7:
+            relative_time = f"{diff.in_days()} days ago"
+        elif diff.in_days() < 30:
+            weeks = diff.in_days() // 7
+            relative_time = f"{weeks} week{'s' if weeks > 1 else ''} ago"
+        else:
+            relative_time = dt.format("ddd MMM D YYYY")
+    except Exception:
+        pass
+
+    # Include score if present (helps with debugging/transparency)
+    score_str = f", score {score:.2f}" if score else ""
+    return f"Memory #{mem_id} ({relative_time}{score_str}):\n{content}"
+
+
+async def _get_pending_memorables(session_id: str) -> list[str] | None:
+    """Get pending memorables from Redis and clear them.
+
+    Returns:
+        List of memorable strings, or None if none pending
+    """
+    if not REDIS_URL:
+        return None
+
+    try:
+        redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+        key = f"intro:memorables:{session_id}"
+
+        # Get all memorables
+        memorables = await redis_client.lrange(key, 0, -1)
+
+        # Clear them (we've consumed them)
+        if memorables:
+            await redis_client.delete(key)
+
+        await redis_client.aclose()
+        return memorables if memorables else None
+
+    except Exception as e:
+        logfire.warn(f"Failed to get memorables: {e}")
+        return None
 
 
 class AlphaClient:
-    """Long-lived client that wraps Claude Agent SDK with Alpha transformation.
+    """Long-lived client that wraps Claude Agent SDK.
 
-    The SDK has ~4 second startup cost, so we keep one client alive and reuse
-    it across conversations. Session switching is handled internally.
+    Proxyless architecture:
+    - System prompt = just the soul (small, truly static)
+    - Orientation = injected in first user message of session
+    - Memories = per-turn, in user content
+    - Memorables = per-turn nudge, in user content
 
-    Usage (long-lived):
-        client = AlphaClient(cwd="/Pondside")
-        await client.connect()
-
-        # Multiple conversations
-        await client.query(prompt, session_id="abc123")
-        async for event in client.stream():
-            yield event
-
-        await client.query(other_prompt, session_id="xyz789")
-        async for event in client.stream():
-            yield event
-
-        await client.disconnect()
-
-    Usage (context manager for one-shot):
+    Usage:
         async with AlphaClient(cwd="/Pondside") as client:
-            await client.query(prompt, session_id=session_id)
+            await client.query("Hello!", session_id=None)  # New session
             async for event in client.stream():
-                yield event
+                print(event)
+
+            await client.query("Continue...", session_id=client.session_id)
+            async for event in client.stream():
+                print(event)
     """
 
     def __init__(
@@ -90,11 +148,7 @@ class AlphaClient:
             mcp_servers: Dict of MCP server configurations
             archive: Whether to archive turns to Postgres
             include_partial_messages: Stream partial messages for real-time updates
-            permission_mode: How to handle tool permission requests:
-                - "default": Standard interactive permission behavior
-                - "acceptEdits": Auto-accept file edits, ask for others
-                - "plan": Planning mode, no execution
-                - "bypassPermissions": Skip all permission checks (emergency mode)
+            permission_mode: How to handle tool permission requests
         """
         self.cwd = cwd
         self.client_name = client_name
@@ -106,14 +160,19 @@ class AlphaClient:
         self.permission_mode = permission_mode
 
         # Internal state
-        self._proxy: AlphaProxy | None = None
         self._sdk_client: ClaudeSDKClient | None = None
         self._current_session_id: str | None = None
+        self._system_prompt: str | None = None  # Just the soul, assembled once
+        self._orientation_blocks: list[dict] | None = None  # Cached for re-injection
+
+        # Turn state
         self._last_user_content: str = ""
         self._last_assistant_content: str = ""
         self._turn_span: logfire.LogfireSpan | None = None
         self._suggest_task: asyncio.Task | None = None
-        self._system_prompt: list[dict] | None = None  # Assembled system prompt for current turn
+
+        # Compaction flag - set by PreCompact hook, cleared after re-orientation
+        self._needs_reorientation: bool = False
 
     # -------------------------------------------------------------------------
     # Session Discovery (static methods)
@@ -121,28 +180,12 @@ class AlphaClient:
 
     @staticmethod
     def list_sessions(cwd: str = "/Pondside", limit: int = 50) -> list[SessionInfo]:
-        """List available sessions for resumption.
-
-        Args:
-            cwd: Working directory
-            limit: Maximum sessions to return
-
-        Returns:
-            List of SessionInfo objects, most recent first
-        """
+        """List available sessions for resumption."""
         return list_sessions(cwd, limit)
 
     @staticmethod
     def get_session_path(session_id: str, cwd: str = "/Pondside") -> str:
-        """Get the filesystem path for a session.
-
-        Args:
-            session_id: The session UUID
-            cwd: Working directory
-
-        Returns:
-            Path to the session's JSONL file
-        """
+        """Get the filesystem path for a session."""
         return str(get_session_path(session_id, cwd))
 
     # -------------------------------------------------------------------------
@@ -150,27 +193,31 @@ class AlphaClient:
     # -------------------------------------------------------------------------
 
     async def connect(self, session_id: str | None = None) -> None:
-        """Connect to Claude, optionally resuming a session.
+        """Connect to Claude.
+
+        Assembles the system prompt (soul only) and creates the SDK client.
+        Orientation will be injected on the first query.
 
         Args:
             session_id: Session to resume, or None for new session
         """
-        # Start the async proxy (same event loop, shared trace context)
-        # Pass self so proxy can access our state (system prompt, etc.)
-        self._proxy = AlphaProxy(alpha_client=self)
-        port = await self._proxy.start()
+        with logfire.span("alpha.connect") as span:
+            # Build the system prompt - just the soul
+            self._system_prompt = f"# Alpha\n\n{get_soul()}"
+            span.set_attribute("system_prompt_length", len(self._system_prompt))
 
-        # Set environment for SDK
-        os.environ["ANTHROPIC_BASE_URL"] = self._proxy.base_url
+            # Pre-build orientation blocks (will be injected on first turn)
+            self._orientation_blocks = await self._build_orientation()
+            span.set_attribute("orientation_blocks", len(self._orientation_blocks))
 
-        # Create SDK client
-        await self._create_sdk_client(session_id)
+            # Create SDK client with system prompt
+            await self._create_sdk_client(session_id)
 
-        logfire.debug(f"AlphaClient connected (proxy on port {port})")
+            logfire.info(f"AlphaClient connected (soul: {len(self._system_prompt)} chars)")
 
     async def disconnect(self) -> None:
         """Disconnect and clean up resources."""
-        # Wait for any pending suggest task to complete before teardown
+        # Wait for any pending suggest task
         if self._suggest_task is not None:
             try:
                 await self._suggest_task
@@ -182,15 +229,6 @@ class AlphaClient:
         if self._sdk_client:
             await self._sdk_client.disconnect()
             self._sdk_client = None
-
-        # Stop proxy
-        if self._proxy:
-            await self._proxy.stop()
-            self._proxy = None
-
-        # Restore environment
-        if "ANTHROPIC_BASE_URL" in os.environ:
-            del os.environ["ANTHROPIC_BASE_URL"]
 
         self._current_session_id = None
         logfire.debug("AlphaClient disconnected")
@@ -210,84 +248,93 @@ class AlphaClient:
 
     async def query(
         self,
-        prompt: str | list[dict[str, Any]] | AsyncIterable[dict[str, Any]],
+        prompt: str | list[dict[str, Any]],
         session_id: str | None = None,
-        fork_from: str | None = None,
     ) -> None:
         """Send a query to the agent.
 
         Args:
-            prompt: The user's message - string, content blocks, or async generator
+            prompt: The user's message - string or content blocks
             session_id: Session to resume, or None for new session
-            fork_from: Session to fork from (creates new session with context)
         """
-        # Start the root turn span (will be ended in stream())
+        # Start the root turn span
         self._turn_span = logfire.span(
             "alpha.turn",
             session_id=session_id or "new",
-            fork_from=fork_from,
             client_name=self.client_name,
         )
         self._turn_span.__enter__()
 
-        # Capture trace context so proxy spans nest under this turn
-        if self._proxy:
-            self._proxy.set_trace_context(logfire.get_context())
-
         with logfire.span("alpha.query") as span:
             # Handle session switching
-            await self._ensure_session(session_id, fork_from)
+            await self._ensure_session(session_id)
 
             if not self._sdk_client:
                 raise RuntimeError("Client not connected. Call connect() first.")
 
-            # Handle async generator (streaming input) - pass through to SDK
-            if hasattr(prompt, "__aiter__"):
-                await self._sdk_client.query(prompt)
-                return
-
-            # For string or content blocks, build the envelope with canary
-            memories: list[dict] | None = None
-
             # Extract text for memory operations
             if isinstance(prompt, str):
-                self._last_user_content = prompt
                 prompt_text = prompt
             else:
-                # Content blocks - extract text for preview/memories
                 text_parts = [b.get("text", "") for b in prompt if b.get("type") == "text"]
                 prompt_text = " ".join(text_parts)
-                self._last_user_content = prompt_text
 
-            span.set_attribute("prompt_length", len(prompt_text))
+            self._last_user_content = prompt_text
             span.set_attribute("prompt_preview", prompt_text[:200])
-            self._turn_span.set_attribute("prompt_preview", prompt_text[:100])
 
-            # Recall memories based on the prompt
+            # Build content blocks
+            content_blocks: list[dict[str, Any]] = []
+
+            # Check if we need orientation (new session or post-compact)
+            needs_orientation = (session_id is None) or self._needs_reorientation
+
+            if needs_orientation:
+                # Re-build orientation in case it's stale (post-compact)
+                if self._needs_reorientation:
+                    self._orientation_blocks = await self._build_orientation()
+
+                # Add orientation blocks
+                if self._orientation_blocks:
+                    content_blocks.extend(self._orientation_blocks)
+                    span.set_attribute("orientation_injected", True)
+                    span.set_attribute("orientation_blocks", len(self._orientation_blocks))
+
+                self._needs_reorientation = False
+
+            # Check for memorables from previous turn (the nudge)
+            if self._current_session_id:
+                memorables = await _get_pending_memorables(self._current_session_id)
+                if memorables:
+                    nudge = "## Intro speaks\n\n"
+                    nudge += "Alpha, consider storing these from the previous turn:\n"
+                    nudge += "\n".join(f"- {m}" for m in memorables)
+                    content_blocks.append({"type": "text", "text": nudge})
+                    span.set_attribute("memorables_nudged", len(memorables))
+
+            # Recall memories for this prompt
             memories = await recall(prompt_text, self._current_session_id or "new")
             if memories:
+                for mem in memories:
+                    content_blocks.append({
+                        "type": "text",
+                        "text": _format_memory(mem)
+                    })
                 span.set_attribute("memories_recalled", len(memories))
-                self._turn_span.set_attribute("memories_recalled", len(memories))
-                logfire.debug(f"Recalled {len(memories)} memories")
 
-            # Assemble system prompt now (proxy will grab it from self._system_prompt)
-            self._system_prompt = await assemble(
-                client=self.client_name,
-                hostname=self.hostname,
-            )
-            span.set_attribute("system_blocks", len(self._system_prompt))
+            # Add the user's actual prompt
+            if isinstance(prompt, str):
+                content_blocks.append({"type": "text", "text": prompt})
+            else:
+                content_blocks.extend(prompt)
 
-            # Build the envelope with canary
-            content_blocks = build_envelope(
-                prompt=prompt,
-                session_id=self._current_session_id,
-                client_name=self.client_name,
-                memories=memories,
-            )
             span.set_attribute("content_blocks", len(content_blocks))
 
-            # Write directly to transport (bypass SDK's query() which only takes strings)
-            message = build_user_message(content_blocks, self._current_session_id)
+            # Send via transport bypass (SDK query() only takes strings)
+            message = {
+                "type": "user",
+                "message": {"role": "user", "content": content_blocks},
+                "session_id": self._current_session_id or "new",
+            }
             await self._sdk_client._transport.write(json.dumps(message) + "\n")
             logfire.debug(f"Sent message with {len(content_blocks)} content blocks")
 
@@ -295,7 +342,7 @@ class AlphaClient:
         """Stream responses from the agent.
 
         Yields:
-            Message objects from the SDK (StreamEvent, AssistantMessage, ResultMessage, etc.)
+            Message objects from the SDK
         """
         if not self._sdk_client:
             raise RuntimeError("Client not connected. Call connect() first.")
@@ -317,19 +364,25 @@ class AlphaClient:
                     # Capture session ID and stats from result
                     if isinstance(message, ResultMessage):
                         self._current_session_id = message.session_id
-                        span.set_attribute("final_session_id", message.session_id)
+                        span.set_attribute("session_id", message.session_id)
                         span.set_attribute("duration_ms", message.duration_ms)
                         span.set_attribute("num_turns", message.num_turns)
                         if message.total_cost_usd:
                             span.set_attribute("cost_usd", message.total_cost_usd)
                         if message.usage:
                             span.set_attribute("usage", str(message.usage))
+                            # Set gen_ai attributes on turn span
+                            if self._turn_span:
+                                input_tokens = message.usage.get("input_tokens", 0)
+                                output_tokens = message.usage.get("output_tokens", 0)
+                                if input_tokens:
+                                    self._turn_span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
+                                if output_tokens:
+                                    self._turn_span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
 
-                        # Also set on root turn span
                         if self._turn_span:
                             self._turn_span.set_attribute("session_id", message.session_id)
                             self._turn_span.set_attribute("duration_ms", message.duration_ms)
-                            self._turn_span.set_attribute("num_turns", message.num_turns)
                             if message.total_cost_usd:
                                 self._turn_span.set_attribute("cost_usd", message.total_cost_usd)
 
@@ -343,8 +396,7 @@ class AlphaClient:
                 if self._turn_span:
                     self._turn_span.set_attribute("response_length", len(self._last_assistant_content))
 
-                    # Add gen_ai.* attributes to the turn span for easy inspection
-                    # This gives the full picture without digging into child spans
+                    # Add gen_ai.* attributes for Logfire panel
                     input_msg = json.dumps([{
                         "role": "user",
                         "parts": [{"type": "text", "content": self._last_user_content}]
@@ -358,23 +410,7 @@ class AlphaClient:
                     self._turn_span.set_attribute("gen_ai.operation.name", "chat")
                     self._turn_span.set_attribute("gen_ai.system", "anthropic")
 
-                    # Include the system prompt - this is the big one
-                    if self._system_prompt:
-                        # Format system prompt as gen_ai.system_instructions
-                        # (structured JSON array per OTel spec)
-                        system_parts = []
-                        for block in self._system_prompt:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                system_parts.append({
-                                    "type": "text",
-                                    "content": block.get("text", "")
-                                })
-                        self._turn_span.set_attribute(
-                            "gen_ai.system_instructions",
-                            json.dumps(system_parts)
-                        )
-
-                # Launch suggest as background task (will be awaited in disconnect)
+                # Launch suggest as background task
                 if self._last_user_content and self._last_assistant_content:
                     self._suggest_task = asyncio.create_task(
                         suggest(
@@ -407,21 +443,52 @@ class AlphaClient:
     # Internal
     # -------------------------------------------------------------------------
 
-    async def _ensure_session(
-        self,
-        session_id: str | None,
-        fork_from: str | None = None,
-    ) -> None:
-        """Ensure we have the right SDK client for the requested session.
+    async def _build_orientation(self) -> list[dict[str, Any]]:
+        """Build orientation blocks for session start.
 
-        If session_id matches current, reuse. Otherwise, recreate.
+        This includes everything except the soul (which is in system prompt):
+        - Capsules (yesterday, last night)
+        - Letter from last night
+        - Today so far
+        - Here (client, machine, weather)
+        - ALPHA.md context files
+        - Events
+        - Todos
         """
+        with logfire.span("build_orientation") as span:
+            # Use the existing assemble() but we'll extract just the non-soul parts
+            all_blocks = await assemble(
+                client=self.client_name,
+                hostname=self.hostname,
+            )
+
+            # Skip the first block (which is the soul)
+            # The soul starts with "# Alpha\n\n"
+            orientation_blocks = []
+            for block in all_blocks:
+                text = block.get("text", "")
+                if not text.startswith("# Alpha\n\n"):
+                    orientation_blocks.append(block)
+
+            span.set_attribute("orientation_blocks", len(orientation_blocks))
+            return orientation_blocks
+
+    async def _on_pre_compact(
+        self,
+        input: PreCompactHookInput,
+        tool_use_id: str | None,
+        context: HookContext,
+    ) -> dict[str, Any]:
+        """Hook called before compaction - flag that we need to re-orient."""
+        logfire.info("Compaction triggered, will re-orient on next turn")
+        self._needs_reorientation = True
+        return {"continue_": True}
+
+    async def _ensure_session(self, session_id: str | None) -> None:
+        """Ensure we have the right SDK client for the requested session."""
         needs_new_client = False
 
-        if fork_from:
-            # Forking always creates a new session
-            needs_new_client = True
-        elif session_id is None:
+        if session_id is None:
             # New session requested
             if self._current_session_id is not None:
                 needs_new_client = True
@@ -430,43 +497,39 @@ class AlphaClient:
             needs_new_client = True
 
         if needs_new_client:
-            await self._create_sdk_client(session_id, fork_from)
+            await self._create_sdk_client(session_id)
 
-    async def _create_sdk_client(
-        self,
-        session_id: str | None = None,
-        fork_from: str | None = None,
-    ) -> None:
-        """Create or recreate the SDK client.
-
-        Args:
-            session_id: Session to resume
-            fork_from: Session to fork from
-        """
+    async def _create_sdk_client(self, session_id: str | None = None) -> None:
+        """Create or recreate the SDK client."""
         # Disconnect existing client if any
         if self._sdk_client:
             await self._sdk_client.disconnect()
 
-        # Build options
+        # Build hooks config for PreCompact
+        hooks = {
+            "PreCompact": [
+                HookMatcher(
+                    matcher=None,  # Match all
+                    hooks=[self._on_pre_compact],
+                )
+            ]
+        }
+
+        # Build options with our system prompt
         options = ClaudeAgentOptions(
             cwd=self.cwd,
+            system_prompt=self._system_prompt,  # Just the soul!
             allowed_tools=self.allowed_tools or [],
             mcp_servers=self.mcp_servers,
             include_partial_messages=self.include_partial_messages,
             resume=session_id,
-            fork_session=fork_from is not None,
             permission_mode=self.permission_mode,
+            hooks=hooks,
         )
-
-        # If forking, we need to set resume to the fork source
-        if fork_from:
-            options.resume = fork_from
 
         # Create and connect
         self._sdk_client = ClaudeSDKClient(options)
         await self._sdk_client.connect()
 
         self._current_session_id = session_id
-        logfire.debug(
-            f"SDK client created (session={session_id or 'new'}, fork={fork_from})"
-        )
+        logfire.debug(f"SDK client created (session={session_id or 'new'})")
