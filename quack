@@ -1,0 +1,215 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "rich>=13.0",
+#     "prompt-toolkit>=3.0",
+#     "alpha_sdk @ file:///Pondside/Basement/alpha_sdk",
+# ]
+# ///
+"""
+quack - Emergency Alpha hotline.
+
+Usage:
+    quack                    # New session
+    quack <session-id>       # Resume session
+    quack --list             # List recent sessions
+    quack --debug            # Enable Logfire console output
+
+A minimal CLI for talking to Alpha when everything else is broken.
+"""
+
+import asyncio
+import sys
+from pathlib import Path
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.patch_stdout import patch_stdout
+from rich.console import Console
+
+from alpha_sdk import AlphaClient
+from alpha_sdk.observability import configure
+
+console = Console(width=100)
+
+# History file for up-arrow recall
+HISTORY_FILE = Path.home() / ".quack_history"
+
+
+def print_tool_start(name: str, input_preview: str) -> None:
+    """Print tool call start with breathing room."""
+    preview = input_preview[:80] + "..." if len(input_preview) > 80 else input_preview
+    console.print()  # Blank line before tool call
+    console.print(f"  🔧 [bold cyan]{name}[/]: {preview}")
+
+
+def print_tool_result(output: str, is_error: bool = False) -> None:
+    """Print tool result (truncated) with breathing room after."""
+    lines = output.strip().split("\n")
+    if len(lines) > 10:
+        lines = lines[:10] + [f"... ({len(lines) - 10}) more lines"]
+
+    style = "red" if is_error else "dim"
+    for line in lines:
+        truncated = line[:95] + "..." if len(line) > 95 else line
+        console.print(f"     [dim]→[/] [{style}]{truncated}[/]")
+    console.print()  # Blank line after tool result
+
+
+async def run_conversation(session_id: str | None = None) -> None:
+    """Main conversation loop."""
+
+    # Set up prompt-toolkit for nice input with history
+    prompt_session: PromptSession[str] = PromptSession(
+        history=FileHistory(str(HISTORY_FILE)),
+    )
+
+    async with AlphaClient(
+        cwd="/Pondside",
+        client_name="quack",
+        permission_mode="bypassPermissions",  # Emergency hotline = no mother-may-I
+    ) as client:
+        # Show session info
+        if session_id:
+            console.print(f"🦆 Resuming: [bold]{session_id[:12]}[/]", style="dim")
+        else:
+            console.print("🦆 [bold]quack[/] — new session", style="dim")
+        console.print()
+
+        while True:
+            # Get input with prompt-toolkit (nice history, paste handling)
+            try:
+                with patch_stdout():
+                    prompt = await prompt_session.prompt_async("You: ")
+            except (KeyboardInterrupt, EOFError):
+                console.print()
+                break
+
+            if not prompt.strip():
+                continue
+
+            if prompt.strip().lower() in ("/quit", "/exit", "/q"):
+                break
+
+            # Send query
+            await client.query(prompt, session_id=session_id)
+
+            # Stream response - simple print, Rich Console handles wrap
+            console.print()
+
+            async for event in client.stream():
+                # Handle streaming deltas (raw SSE events)
+                if hasattr(event, "event"):
+                    evt = event.event
+                    evt_type = evt.get("type", "")
+
+                    # Text streaming - print as it arrives
+                    if evt_type == "content_block_delta":
+                        delta = evt.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            text = delta.get("text", "")
+                            # soft_wrap=True lets Rich handle word boundaries
+                            console.print(text, end="", markup=False, soft_wrap=True)
+
+                # Handle tool use blocks (complete tool call info)
+                elif hasattr(event, "content"):
+                    for block in getattr(event, "content", []):
+                        # Tool use block - show what we're calling
+                        if hasattr(block, "name") and hasattr(block, "input"):
+                            tool_name = block.name
+                            tool_input = block.input
+
+                            # Format input preview based on tool type
+                            if tool_name == "Bash":
+                                preview = tool_input.get("command", str(tool_input))
+                            elif tool_name == "Read":
+                                preview = tool_input.get("file_path", str(tool_input))
+                            elif tool_name == "Write":
+                                preview = tool_input.get("file_path", str(tool_input))
+                            elif tool_name == "Grep":
+                                preview = f'{tool_input.get("pattern", "")} in {tool_input.get("path", ".")}'
+                            elif tool_name == "Glob":
+                                preview = f'{tool_input.get("pattern", "")} in {tool_input.get("path", ".")}'
+                            else:
+                                preview = str(tool_input)[:60]
+
+                            print_tool_start(tool_name, preview)
+
+                        # Tool result block
+                        elif hasattr(block, "tool_use_id") and hasattr(block, "content"):
+                            result_content = block.content
+                            is_error = getattr(block, "is_error", False)
+
+                            # Handle different result formats
+                            if isinstance(result_content, str):
+                                print_tool_result(result_content, is_error)
+                            elif isinstance(result_content, list):
+                                for item in result_content:
+                                    if isinstance(item, dict) and "text" in item:
+                                        print_tool_result(item["text"], is_error)
+
+            # Finish response
+            console.print()
+            console.print()
+
+            # Update session_id for next turn (captures new session ID)
+            session_id = client.session_id
+
+        # Show final session ID for resumption
+        if client.session_id:
+            console.print(f"🦆 Session: [bold]{client.session_id}[/]", style="dim")
+
+
+def list_sessions() -> None:
+    """List recent sessions."""
+    sessions = AlphaClient.list_sessions(cwd="/Pondside", limit=10)
+
+    if not sessions:
+        console.print("No sessions found.", style="dim")
+        return
+
+    console.print("🦆 Recent sessions:", style="bold")
+    console.print()
+
+    for s in sessions:
+        # Format: ID (truncated) | time ago | preview
+        preview = s.preview[:50] + "..." if len(s.preview) > 50 else s.preview
+        console.print(f"  [bold cyan]{s.id[:12]}[/]  {preview}", style="dim")
+
+    console.print()
+    console.print("Resume with: [bold]quack <session-id>[/]", style="dim")
+
+
+async def main() -> None:
+    """Entry point."""
+    args = sys.argv[1:]
+
+    # Check for debug flag first (before configure)
+    debug_mode = "--debug" in args or "-d" in args
+    if debug_mode:
+        args = [a for a in args if a not in ("--debug", "-d")]
+
+    # Configure observability (quiet by default, verbose with --debug)
+    configure("quack", debug=debug_mode)
+
+    if "--list" in args or "-l" in args:
+        list_sessions()
+        return
+
+    if "--help" in args or "-h" in args:
+        console.print(__doc__)
+        return
+
+    # Remaining arg is session_id (filter out flags)
+    session_id = None
+    for arg in args:
+        if not arg.startswith("-"):
+            session_id = arg
+            break
+
+    await run_conversation(session_id)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -12,9 +12,17 @@ Wraps Claude Agent SDK with:
 import asyncio
 import json
 import os
-from typing import Any, AsyncGenerator, AsyncIterable
+from typing import Any, AsyncGenerator, AsyncIterable, Literal
 
 import logfire
+
+# Permission modes supported by Claude Agent SDK
+PermissionMode = Literal[
+    "default",           # Standard permission behavior
+    "acceptEdits",       # Auto-accept file edits
+    "plan",              # Planning mode - no execution
+    "bypassPermissions"  # Bypass all permission checks (use with caution)
+]
 
 from claude_agent_sdk import (
     ClaudeSDKClient,
@@ -70,6 +78,7 @@ class AlphaClient:
         mcp_servers: dict | None = None,
         archive: bool = True,
         include_partial_messages: bool = True,
+        permission_mode: PermissionMode = "default",
     ):
         """Initialize the Alpha client.
 
@@ -81,6 +90,11 @@ class AlphaClient:
             mcp_servers: Dict of MCP server configurations
             archive: Whether to archive turns to Postgres
             include_partial_messages: Stream partial messages for real-time updates
+            permission_mode: How to handle tool permission requests:
+                - "default": Standard interactive permission behavior
+                - "acceptEdits": Auto-accept file edits, ask for others
+                - "plan": Planning mode, no execution
+                - "bypassPermissions": Skip all permission checks (emergency mode)
         """
         self.cwd = cwd
         self.client_name = client_name
@@ -89,6 +103,7 @@ class AlphaClient:
         self.mcp_servers = mcp_servers or {}
         self.archive = archive
         self.include_partial_messages = include_partial_messages
+        self.permission_mode = permission_mode
 
         # Internal state
         self._proxy: AlphaProxy | None = None
@@ -440,6 +455,7 @@ class AlphaClient:
             include_partial_messages=self.include_partial_messages,
             resume=session_id,
             fork_session=fork_from is not None,
+            permission_mode=self.permission_mode,
         )
 
         # If forking, we need to set resume to the fork source
