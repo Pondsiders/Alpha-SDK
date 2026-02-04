@@ -372,8 +372,13 @@ class AlphaClient:
     async def stream(self) -> AsyncGenerator[Any, None]:
         """Stream responses from the agent.
 
-        Progressive observability: gen_ai.* attributes update after each message,
-        so if the turn hangs you can see everything up to that point in Logfire.
+        Creates one span per API inference call:
+        - alpha.inference.0: user prompt → assistant (possibly with tool calls)
+        - alpha.inference.1: tool_call + tool_result → assistant continues
+        - alpha.inference.N: tool_call + tool_result → final response
+
+        Each inference span has its own gen_ai.input.messages and gen_ai.output.messages.
+        Tool calls are paired with their results in the input for visual clarity in Logfire.
 
         Yields:
             Message objects from the SDK
@@ -382,17 +387,45 @@ class AlphaClient:
             raise RuntimeError("Client not connected. Call connect() first.")
 
         try:
-            with logfire.span("alpha.stream") as span:
+            with logfire.span("alpha.stream") as stream_span:
                 assistant_text_parts: list[str] = []
                 message_count = 0
+                inference_count = 0
 
-                # Progressive accumulation for gen_ai.* attributes
-                # Input: user message + tool results
-                # Output: assistant text + tool calls
+                # Current inference span state
+                inference_span: logfire.LogfireSpan | None = None
                 input_messages: list[dict] = []
                 output_messages: list[dict] = []
 
-                # Initialize with user message (our injected content)
+                # Stash tool calls so we can pair them with results
+                # Maps tool_use_id -> tool_call dict
+                pending_tool_calls: dict[str, dict] = {}
+
+                def _start_inference_span(inference_num: int, initial_input: list[dict]) -> logfire.LogfireSpan:
+                    """Start a new inference span with initial input."""
+                    span = logfire.span(
+                        "alpha.inference.{n}",
+                        n=inference_num,
+                    )
+                    span.__enter__()
+                    # Set initial attributes
+                    if self._system_prompt:
+                        span.set_attribute(
+                            "gen_ai.system_instructions",
+                            json.dumps([{"type": "text", "content": self._system_prompt}])
+                        )
+                    span.set_attribute("gen_ai.input.messages", json.dumps(initial_input))
+                    span.set_attribute("gen_ai.output.messages", json.dumps([]))
+                    span.set_attribute("gen_ai.operation.name", "chat")
+                    span.set_attribute("gen_ai.system", "anthropic")
+                    return span
+
+                def _end_inference_span(span: logfire.LogfireSpan, outputs: list[dict]) -> None:
+                    """End an inference span with final outputs."""
+                    span.set_attribute("gen_ai.output.messages", json.dumps(outputs))
+                    span.__exit__(None, None, None)
+
+                # Build initial user message from our injected content
                 user_parts = []
                 for block in self._last_content_blocks:
                     if block.get("type") == "text":
@@ -400,19 +433,10 @@ class AlphaClient:
                             "type": "text",
                             "content": block.get("text", "")
                         })
-                input_messages.append({"role": "user", "parts": user_parts})
+                input_messages = [{"role": "user", "parts": user_parts}]
 
-                # Set initial gen_ai attributes (system prompt + user message)
-                if self._turn_span:
-                    if self._system_prompt:
-                        self._turn_span.set_attribute(
-                            "gen_ai.system_instructions",
-                            json.dumps([{"type": "text", "content": self._system_prompt}])
-                        )
-                    self._turn_span.set_attribute("gen_ai.input.messages", json.dumps(input_messages))
-                    self._turn_span.set_attribute("gen_ai.output.messages", json.dumps(output_messages))
-                    self._turn_span.set_attribute("gen_ai.operation.name", "chat")
-                    self._turn_span.set_attribute("gen_ai.system", "anthropic")
+                # Start first inference span
+                inference_span = _start_inference_span(inference_count, input_messages)
 
                 async for message in self._sdk_client.receive_response():
                     message_count += 1
@@ -438,52 +462,77 @@ class AlphaClient:
                                     "content": block.text
                                 })
                             elif isinstance(block, ToolUseBlock):
-                                assistant_parts.append({
+                                tool_call = {
                                     "type": "tool_call",
                                     "id": block.id,
                                     "name": block.name,
-                                    "arguments": block.input,  # Logfire expects "arguments"
-                                })
+                                    "arguments": block.input,
+                                }
+                                assistant_parts.append(tool_call)
+                                # Stash for pairing with result later
+                                pending_tool_calls[block.id] = tool_call
                         if assistant_parts:
                             output_messages.append({"role": "assistant", "parts": assistant_parts})
                             # Update span progressively
-                            if self._turn_span:
-                                self._turn_span.set_attribute("gen_ai.output.messages", json.dumps(output_messages))
+                            if inference_span:
+                                inference_span.set_attribute("gen_ai.output.messages", json.dumps(output_messages))
 
-                    # Handle user messages (tool results)
+                    # Handle user messages (tool results) - this triggers a new inference span
                     elif isinstance(message, UserMessage):
                         if isinstance(message.content, list):
-                            tool_result_parts = []
                             for block in message.content:
                                 if isinstance(block, ToolResultBlock):
-                                    # Format tool result content
                                     result_content = block.content
                                     if isinstance(result_content, list):
                                         result_content = json.dumps(result_content)
                                     elif result_content is None:
                                         result_content = ""
-                                    tool_result_parts.append({
-                                        "type": "tool_call_response",  # Logfire expects this type
-                                        "id": block.tool_use_id,  # Logfire expects "id" not "tool_use_id"
-                                        "result": str(result_content)[:500],  # Logfire expects "result"
-                                    })
-                            if tool_result_parts:
-                                input_messages.append({"role": "user", "parts": tool_result_parts})
-                                # Update span progressively
-                                if self._turn_span:
-                                    self._turn_span.set_attribute("gen_ai.input.messages", json.dumps(input_messages))
+
+                                    # End current inference span
+                                    if inference_span:
+                                        _end_inference_span(inference_span, output_messages)
+
+                                    # Build input: tool_call (from stash) + tool_result
+                                    inference_count += 1
+                                    new_input: list[dict] = []
+
+                                    # Include the tool_call that caused this result
+                                    tool_call = pending_tool_calls.pop(block.tool_use_id, None)
+                                    if tool_call:
+                                        new_input.append({"role": "assistant", "parts": [tool_call]})
+
+                                    # Include the tool result
+                                    tool_result = {
+                                        "type": "tool_call_response",
+                                        "id": block.tool_use_id,
+                                        "response": str(result_content)[:500],
+                                    }
+                                    new_input.append({"role": "tool", "parts": [tool_result]})
+
+                                    # Start new inference span
+                                    output_messages = []
+                                    inference_span = _start_inference_span(inference_count, new_input)
 
                     # Capture session ID and stats from result
                     if isinstance(message, ResultMessage):
                         self._current_session_id = message.session_id
-                        span.set_attribute("session_id", message.session_id)
-                        span.set_attribute("duration_ms", message.duration_ms)
-                        span.set_attribute("num_turns", message.num_turns)
+                        stream_span.set_attribute("session_id", message.session_id)
+                        stream_span.set_attribute("duration_ms", message.duration_ms)
+                        stream_span.set_attribute("num_turns", message.num_turns)
+                        stream_span.set_attribute("inference_count", inference_count + 1)
                         if message.total_cost_usd:
-                            span.set_attribute("cost_usd", message.total_cost_usd)
+                            stream_span.set_attribute("cost_usd", message.total_cost_usd)
                         if message.usage:
-                            span.set_attribute("usage", str(message.usage))
-                            if self._turn_span:
+                            stream_span.set_attribute("usage", str(message.usage))
+
+                        # Also set on turn span
+                        if self._turn_span:
+                            self._turn_span.set_attribute("session_id", message.session_id)
+                            self._turn_span.set_attribute("duration_ms", message.duration_ms)
+                            self._turn_span.set_attribute("inference_count", inference_count + 1)
+                            if message.total_cost_usd:
+                                self._turn_span.set_attribute("cost_usd", message.total_cost_usd)
+                            if message.usage:
                                 input_tokens = message.usage.get("input_tokens", 0)
                                 output_tokens = message.usage.get("output_tokens", 0)
                                 if input_tokens:
@@ -491,18 +540,16 @@ class AlphaClient:
                                 if output_tokens:
                                     self._turn_span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
 
-                        if self._turn_span:
-                            self._turn_span.set_attribute("session_id", message.session_id)
-                            self._turn_span.set_attribute("duration_ms", message.duration_ms)
-                            if message.total_cost_usd:
-                                self._turn_span.set_attribute("cost_usd", message.total_cost_usd)
-
                     yield message
+
+                # End final inference span
+                if inference_span:
+                    _end_inference_span(inference_span, output_messages)
 
                 # Store accumulated text for memorables extraction
                 self._last_assistant_content = "".join(assistant_text_parts)
-                span.set_attribute("message_count", message_count)
-                span.set_attribute("response_length", len(self._last_assistant_content))
+                stream_span.set_attribute("message_count", message_count)
+                stream_span.set_attribute("response_length", len(self._last_assistant_content))
 
                 if self._turn_span:
                     self._turn_span.set_attribute("response_length", len(self._last_assistant_content))
