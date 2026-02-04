@@ -420,8 +420,10 @@ class AlphaClient:
                     # Log non-streaming messages for debugging
                     # StreamEvent is too noisy (one per SSE delta), skip it
                     if not isinstance(message, StreamEvent):
+                        msg_type = type(message).__name__
                         logfire.debug(
-                            f"sdk.message.{type(message).__name__}",
+                            "sdk.message.{msg_type}",
+                            msg_type=msg_type,
                             message=_message_to_dict(message),
                         )
 
