@@ -442,7 +442,7 @@ class AlphaClient:
                                     "type": "tool_call",
                                     "id": block.id,
                                     "name": block.name,
-                                    "input": block.input
+                                    "arguments": block.input,  # Logfire expects "arguments"
                                 })
                         if assistant_parts:
                             output_messages.append({"role": "assistant", "parts": assistant_parts})
@@ -463,10 +463,9 @@ class AlphaClient:
                                     elif result_content is None:
                                         result_content = ""
                                     tool_result_parts.append({
-                                        "type": "tool_result",
-                                        "tool_use_id": block.tool_use_id,
-                                        "content": str(result_content)[:500],  # Truncate for sanity
-                                        "is_error": block.is_error or False
+                                        "type": "tool_call_response",  # Logfire expects this type
+                                        "id": block.tool_use_id,  # Logfire expects "id" not "tool_use_id"
+                                        "result": str(result_content)[:500],  # Logfire expects "result"
                                     })
                             if tool_result_parts:
                                 input_messages.append({"role": "user", "parts": tool_result_parts})
