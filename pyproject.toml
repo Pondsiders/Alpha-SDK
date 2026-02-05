@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.9.0",
     "asyncpg>=0.30.0",
-    "claude-agent-sdk>=0.1.0",
+    "claude-agent-sdk==0.1.29",
     "httpx>=0.28.0",
     "logfire[httpx]>=3.0.0",
     "pendulum>=3.0.0",

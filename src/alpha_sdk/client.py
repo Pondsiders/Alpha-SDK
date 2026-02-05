@@ -13,6 +13,7 @@ import os
 from typing import Any, AsyncGenerator, AsyncIterable, Literal
 
 import logfire
+import pendulum
 import redis.asyncio as aioredis
 
 # Permission modes supported by Claude Agent SDK
@@ -307,13 +308,47 @@ class AlphaClient:
             prompt: The user's message - string or content blocks
             session_id: Session to resume, or None for new session
         """
-        # Start the root turn span
+        # Extract text for span naming and memory operations
+        if isinstance(prompt, str):
+            prompt_text = prompt
+        else:
+            text_parts = [b.get("text", "") for b in prompt if b.get("type") == "text"]
+            prompt_text = " ".join(text_parts)
+
+        # Build span name from prompt preview (first 50 chars, single line)
+        prompt_preview = prompt_text[:50].replace("\n", " ").strip()
+        if len(prompt_text) > 50:
+            prompt_preview += "…"
+
+        # Start the root turn span with prompt preview in the name
         self._turn_span = logfire.span(
-            "alpha.turn",
+            "alpha.turn: {prompt_preview}",
+            prompt_preview=prompt_preview,
             session_id=session_id or "new",
             client_name=self.client_name,
         )
         self._turn_span.__enter__()
+
+        # Set gen_ai attributes for Model Run card (progressively enhanced)
+        self._turn_span.set_attribute("gen_ai.system", "anthropic")
+        self._turn_span.set_attribute("gen_ai.operation.name", "chat")
+        self._turn_span.set_attribute("gen_ai.request.model", "claude-opus-4-5-20251101")
+        if session_id:
+            self._turn_span.set_attribute("gen_ai.conversation.id", session_id)
+
+        # System instructions = just the soul (the static system prompt)
+        if self._system_prompt:
+            self._turn_span.set_attribute(
+                "gen_ai.system_instructions",
+                json.dumps([{"type": "text", "content": self._system_prompt}])
+            )
+
+        # Input messages placeholder - will be updated in query() after content blocks are built
+        # Set empty now so attribute exists even if request hangs before content is built
+        self._turn_span.set_attribute("gen_ai.input.messages", json.dumps([]))
+
+        # Initialize output messages (will be progressively updated in stream())
+        self._turn_span.set_attribute("gen_ai.output.messages", json.dumps([]))
 
         # Set trace context on proxy so its spans nest under this turn
         if self._compact_proxy:
@@ -325,13 +360,6 @@ class AlphaClient:
 
             if not self._sdk_client:
                 raise RuntimeError("Client not connected. Call connect() first.")
-
-            # Extract text for memory operations
-            if isinstance(prompt, str):
-                prompt_text = prompt
-            else:
-                text_parts = [b.get("text", "") for b in prompt if b.get("type") == "text"]
-                prompt_text = " ".join(text_parts)
 
             self._last_user_content = prompt_text
             span.set_attribute("prompt_preview", prompt_text[:200])
@@ -375,6 +403,14 @@ class AlphaClient:
                     })
                 span.set_attribute("memories_recalled", len(memories))
 
+            # Add PSO-8601 timestamp right before user's prompt
+            # Format: "[Sent Thu Feb 5 2026, 8:03 AM]"
+            sent_at = pendulum.now("America/Los_Angeles").format("ddd MMM D YYYY, h:mm A")
+            content_blocks.append({
+                "type": "text",
+                "text": f"[Sent {sent_at}]"
+            })
+
             # Add the user's actual prompt
             if isinstance(prompt, str):
                 content_blocks.append({"type": "text", "text": prompt})
@@ -385,6 +421,17 @@ class AlphaClient:
 
             # Store for observability (full content, not just user text)
             self._last_content_blocks = content_blocks
+
+            # Update turn span with full structured input (now that we have all content blocks)
+            if self._turn_span:
+                user_parts = []
+                for block in content_blocks:
+                    if block.get("type") == "text":
+                        user_parts.append({"type": "text", "content": block.get("text", "")})
+                self._turn_span.set_attribute(
+                    "gen_ai.input.messages",
+                    json.dumps([{"role": "user", "parts": user_parts}])
+                )
 
             # Send via transport bypass (SDK query() only takes strings)
             message = {
@@ -426,6 +473,10 @@ class AlphaClient:
                 # Stash tool calls so we can pair them with results
                 # Maps tool_use_id -> tool_call dict
                 pending_tool_calls: dict[str, dict] = {}
+
+                # Track accumulated output for turn-level gen_ai.output.messages
+                turn_output_parts: list[dict] = []
+                last_finish_reason: str | None = None
 
                 def _start_inference_span(inference_num: int, initial_input: list[dict]) -> logfire.LogfireSpan:
                     """Start a new inference span with initial input."""
@@ -487,6 +538,11 @@ class AlphaClient:
                                     "type": "text",
                                     "content": block.text
                                 })
+                                # Also track for turn-level output
+                                turn_output_parts.append({
+                                    "type": "text",
+                                    "content": block.text
+                                })
                             elif isinstance(block, ToolUseBlock):
                                 tool_call = {
                                     "type": "tool_call",
@@ -499,9 +555,24 @@ class AlphaClient:
                                 pending_tool_calls[block.id] = tool_call
                         if assistant_parts:
                             output_messages.append({"role": "assistant", "parts": assistant_parts})
-                            # Update span progressively
+                            # Update inference span progressively
                             if inference_span:
                                 inference_span.set_attribute("gen_ai.output.messages", json.dumps(output_messages))
+                            # Update turn span progressively (just text, not tool calls)
+                            if self._turn_span and turn_output_parts:
+                                self._turn_span.set_attribute(
+                                    "gen_ai.output.messages",
+                                    json.dumps([{"role": "assistant", "parts": turn_output_parts}])
+                                )
+
+                        # Capture finish reason (stop_reason on AssistantMessage)
+                        if hasattr(message, 'stop_reason') and message.stop_reason:
+                            last_finish_reason = message.stop_reason
+                            if self._turn_span:
+                                self._turn_span.set_attribute(
+                                    "gen_ai.response.finish_reasons",
+                                    json.dumps([last_finish_reason])
+                                )
 
                     # Handle user messages (tool results) - this triggers a new inference span
                     elif isinstance(message, UserMessage):
@@ -551,20 +622,34 @@ class AlphaClient:
                         if message.usage:
                             stream_span.set_attribute("usage", str(message.usage))
 
-                        # Also set on turn span
+                        # Also set on turn span with full gen_ai attributes
                         if self._turn_span:
                             self._turn_span.set_attribute("session_id", message.session_id)
+                            self._turn_span.set_attribute("gen_ai.conversation.id", message.session_id)
                             self._turn_span.set_attribute("duration_ms", message.duration_ms)
                             self._turn_span.set_attribute("inference_count", inference_count + 1)
                             if message.total_cost_usd:
                                 self._turn_span.set_attribute("cost_usd", message.total_cost_usd)
                             if message.usage:
+                                # Standard token counts
                                 input_tokens = message.usage.get("input_tokens", 0)
                                 output_tokens = message.usage.get("output_tokens", 0)
                                 if input_tokens:
                                     self._turn_span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
                                 if output_tokens:
                                     self._turn_span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+
+                                # Cache token stats (Anthropic-specific)
+                                cache_creation = message.usage.get("cache_creation_input_tokens", 0)
+                                cache_read = message.usage.get("cache_read_input_tokens", 0)
+                                if cache_creation:
+                                    self._turn_span.set_attribute("gen_ai.usage.cache_creation.input_tokens", cache_creation)
+                                if cache_read:
+                                    self._turn_span.set_attribute("gen_ai.usage.cache_read.input_tokens", cache_read)
+
+                            # Response model (might differ from request model)
+                            if hasattr(message, 'model') and message.model:
+                                self._turn_span.set_attribute("gen_ai.response.model", message.model)
 
                     yield message
 

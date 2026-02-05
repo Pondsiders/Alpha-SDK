@@ -12,10 +12,16 @@ We just need to catch:
 1. The summarizer system prompt during compact → replace with Alpha's identity
 2. The compact instructions → replace with Alpha's custom prompt
 3. The "continue without asking" instruction → replace with "stop and check in"
+
+Debug mode:
+Set ALPHA_SDK_CAPTURE_REQUESTS=1 to dump every request to tests/captures/
 """
 
 import json
+import os
 import socket
+from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -26,6 +32,11 @@ import logfire
 from aiohttp import web
 
 ANTHROPIC_API_URL = "https://api.anthropic.com"
+
+# Debug capture mode - dumps raw requests to files
+CAPTURE_REQUESTS = os.environ.get("ALPHA_SDK_CAPTURE_REQUESTS", "").lower() in ("1", "true", "yes")
+# Path: compact_proxy.py -> alpha_sdk/ -> src/ -> alpha_sdk/ -> tests/captures
+CAPTURE_DIR = Path(__file__).parent.parent.parent / "tests" / "captures"
 
 # Headers to forward (auth)
 FORWARD_HEADERS = [
@@ -348,6 +359,28 @@ class CompactProxy:
         """Get the port number."""
         return self._port
 
+    def _capture_request(self, path: str, body: dict) -> None:
+        """Dump request to a JSON file for debugging.
+
+        Only active when ALPHA_SDK_CAPTURE_REQUESTS=1.
+        Files go to tests/captures/{timestamp}_{path_safe}.json
+        """
+        try:
+            CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+
+            # Build filename from timestamp and path
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            path_safe = path.replace("/", "_").strip("_")
+            filename = f"{timestamp}_{path_safe}.json"
+
+            filepath = CAPTURE_DIR / filename
+            with open(filepath, "w") as f:
+                json.dump(body, f, indent=2, default=str)
+
+            logfire.debug(f"Captured request to {filepath}")
+        except Exception as e:
+            logfire.warning(f"Failed to capture request: {e}")
+
     async def _handle_request(self, request: web.Request) -> web.StreamResponse:
         """Handle incoming requests."""
         from contextlib import nullcontext
@@ -394,6 +427,10 @@ class CompactProxy:
         if body is not None:
             rewrite_compact(body)
             body_bytes = json.dumps(body).encode()
+
+        # Debug capture mode - dump request to file
+        if CAPTURE_REQUESTS and body is not None:
+            self._capture_request(path, body)
 
         # Build headers
         headers = {}
