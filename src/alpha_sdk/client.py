@@ -41,6 +41,7 @@ from claude_agent_sdk.types import (
     ToolResultBlock,
 )
 
+from .archive import archive_turn
 from .compact_proxy import CompactProxy
 from .memories.recall import recall
 from .memories.suggest import suggest
@@ -676,6 +677,16 @@ class AlphaClient:
                             self._last_user_content,
                             self._last_assistant_content,
                             self._current_session_id or "unknown",
+                        )
+                    )
+
+                # Archive the turn to Scribe (fire-and-forget)
+                if self.archive and self._last_user_content:
+                    asyncio.create_task(
+                        archive_turn(
+                            user_content=self._last_user_content,
+                            assistant_content=self._last_assistant_content,
+                            session_id=self._current_session_id,
                         )
                     )
         finally:
