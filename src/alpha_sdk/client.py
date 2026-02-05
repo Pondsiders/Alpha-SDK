@@ -1,10 +1,10 @@
 """AlphaClient - the main interface to Alpha.
 
-Proxyless architecture:
+Architecture:
 - System prompt is assembled once at connect() and passed to SDK
 - Orientation (capsules, letter, here, context, etc.) goes in first user message
 - Memories and memorables go in user content, not system prompt
-- No proxy, no canary, no interception
+- Minimal proxy intercepts only compact prompts for rewriting
 """
 
 import asyncio
@@ -40,6 +40,7 @@ from claude_agent_sdk.types import (
     ToolResultBlock,
 )
 
+from .compact_proxy import CompactProxy
 from .memories.recall import recall
 from .memories.suggest import suggest
 from .sessions import list_sessions, get_session_path, get_sessions_dir, SessionInfo
@@ -48,6 +49,9 @@ from .system_prompt.soul import get_soul
 
 # Redis URL for memorables
 REDIS_URL = os.environ.get("REDIS_URL", "redis://alpha-pi:6379")
+
+# Store original ANTHROPIC_BASE_URL so we can restore it
+_ORIGINAL_ANTHROPIC_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL")
 
 
 def _message_to_dict(message: Any) -> dict:
@@ -191,6 +195,7 @@ class AlphaClient:
         self._current_session_id: str | None = None
         self._system_prompt: str | None = None  # Just the soul, assembled once
         self._orientation_blocks: list[dict] | None = None  # Cached for re-injection
+        self._compact_proxy: CompactProxy | None = None  # For compact prompt rewriting
 
         # Turn state
         self._last_user_content: str = ""  # Just the user's text (for memorables)
@@ -223,13 +228,21 @@ class AlphaClient:
     async def connect(self, session_id: str | None = None) -> None:
         """Connect to Claude.
 
-        Assembles the system prompt (soul only) and creates the SDK client.
-        Orientation will be injected on the first query.
+        Starts the compact proxy, assembles the system prompt (soul only),
+        and creates the SDK client. Orientation will be injected on first query.
 
         Args:
             session_id: Session to resume, or None for new session
         """
         with logfire.span("alpha.connect") as span:
+            # Start compact proxy (intercepts only compact prompts for rewriting)
+            self._compact_proxy = CompactProxy()
+            await self._compact_proxy.start()
+            os.environ["ANTHROPIC_BASE_URL"] = self._compact_proxy.base_url
+            span.set_attribute("proxy_port", self._compact_proxy.port)
+            span.set_attribute("anthropic_base_url", self._compact_proxy.base_url)
+            logfire.info(f"Proxy started, ANTHROPIC_BASE_URL={self._compact_proxy.base_url}")
+
             # Build the system prompt - just the soul
             self._system_prompt = f"# Alpha\n\n{get_soul()}"
             span.set_attribute("system_prompt_length", len(self._system_prompt))
@@ -241,7 +254,7 @@ class AlphaClient:
             # Create SDK client with system prompt
             await self._create_sdk_client(session_id)
 
-            logfire.info(f"AlphaClient connected (soul: {len(self._system_prompt)} chars)")
+            logfire.info(f"AlphaClient connected (soul: {len(self._system_prompt)} chars, proxy: {self._compact_proxy.port})")
 
     async def disconnect(self) -> None:
         """Disconnect and clean up resources."""
@@ -257,6 +270,15 @@ class AlphaClient:
         if self._sdk_client:
             await self._sdk_client.disconnect()
             self._sdk_client = None
+
+        # Stop compact proxy and restore original ANTHROPIC_BASE_URL
+        if self._compact_proxy:
+            await self._compact_proxy.stop()
+            self._compact_proxy = None
+            if _ORIGINAL_ANTHROPIC_BASE_URL:
+                os.environ["ANTHROPIC_BASE_URL"] = _ORIGINAL_ANTHROPIC_BASE_URL
+            elif "ANTHROPIC_BASE_URL" in os.environ:
+                del os.environ["ANTHROPIC_BASE_URL"]
 
         self._current_session_id = None
         logfire.debug("AlphaClient disconnected")
@@ -292,6 +314,10 @@ class AlphaClient:
             client_name=self.client_name,
         )
         self._turn_span.__enter__()
+
+        # Set trace context on proxy so its spans nest under this turn
+        if self._compact_proxy:
+            self._compact_proxy.set_trace_context(logfire.get_context())
 
         with logfire.span("alpha.query") as span:
             # Handle session switching
