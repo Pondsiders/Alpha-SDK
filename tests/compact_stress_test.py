@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Stress test to trigger auto-compact and verify prompt rewriting.
+"""Stress test to trigger multiple auto-compacts and verify prompt rewriting.
 
 Streams Wikipedia articles from HuggingFace and sends ~20K TOKEN chunks
 (~80KB chars) to Alpha until context fills and auto-compact triggers.
+Continues after compact to verify multiple compactions work correctly.
 
 Usage:
-    uv run python tests/compact_stress_test.py
+    uv run python tests/compact_stress_test.py [num_chunks]
+
+    Default: 20 chunks (should trigger ~2 compactions)
+    Example: uv run python tests/compact_stress_test.py 30  # ~3 compactions
 
 Requirements:
     pip install datasets
@@ -14,11 +18,12 @@ The test:
 1. Starts a new AlphaClient session
 2. Streams Wikipedia articles, batching into ~20K token chunks
 3. Sends chunks until auto-compact triggers (around chunk 8-10)
-4. Observes that Alpha stops and checks in instead of barreling forward
+4. CONTINUES after compact to trigger additional compactions
+5. Observes that Alpha stops and checks in each time
 
 Watch Logfire for:
-- compact.original_body: The SDK's compact request before rewriting
 - compact.rewrite: The rewritten request with Alpha's prompts
+- Multiple compaction cycles if sending enough chunks
 """
 
 import asyncio
@@ -32,7 +37,7 @@ from alpha_sdk import AlphaClient, configure_observability
 
 # ~20K tokens ≈ ~80K characters (rough estimate: 4 chars/token)
 CHARS_PER_CHUNK = 80000
-NUM_CHUNKS = 15  # Should trigger compact around chunk 8-10
+DEFAULT_NUM_CHUNKS = 20  # Should trigger ~2 compactions
 
 EXPLANATION_PROMPT = """Hey Alpha, it's Jeffery. We're running a stress test to verify the compact prompt rewriting works.
 
@@ -98,17 +103,21 @@ def stream_wikipedia_chunks(chars_per_chunk: int, num_chunks: int):
         yield buffer, chunks_yielded
 
 
-async def run_stress_test():
+async def run_stress_test(num_chunks: int):
     """Run the compact stress test."""
     print("=" * 60)
-    print("COMPACT STRESS TEST - Wikipedia Edition")
+    print("COMPACT STRESS TEST - Wikipedia Edition (Multi-Compact)")
     print("=" * 60)
     print(f"Chunk size: ~{CHARS_PER_CHUNK:,} chars (~{CHARS_PER_CHUNK // 4:,} tokens)")
-    print(f"Max chunks: {NUM_CHUNKS}")
+    print(f"Total chunks: {num_chunks}")
+    print(f"Expected compactions: ~{num_chunks // 10}")
     print("=" * 60)
 
     # Configure observability
     configure_observability(service_name="compact-stress-test")
+
+    compact_count = 0
+    total_tokens_sent = 0
 
     async with AlphaClient(
         cwd="/Pondside",
@@ -118,14 +127,17 @@ async def run_stress_test():
         print(f"\nConnected. Proxy port: {client._compact_proxy.port}")
         print("-" * 60)
 
-        for content, chunk_num in stream_wikipedia_chunks(CHARS_PER_CHUNK, NUM_CHUNKS):
+        for content, chunk_num in stream_wikipedia_chunks(CHARS_PER_CHUNK, num_chunks):
             prompt = EXPLANATION_PROMPT.format(
                 chunk_num=chunk_num,
-                total_chunks=NUM_CHUNKS,
+                total_chunks=num_chunks,
                 content=content,
             )
 
-            print(f"\n[Chunk {chunk_num}/{NUM_CHUNKS}] Sending ~{len(prompt):,} chars (~{len(prompt) // 4:,} tokens)...")
+            estimated_tokens = len(prompt) // 4
+            total_tokens_sent += estimated_tokens
+            print(f"\n[Chunk {chunk_num}/{num_chunks}] Sending ~{len(prompt):,} chars (~{estimated_tokens:,} tokens)...")
+            print(f"    Total tokens sent so far: ~{total_tokens_sent:,}")
 
             await client.query(prompt, session_id=client.session_id)
 
@@ -143,15 +155,34 @@ async def run_stress_test():
 
             # Check if this looks like a post-compact response
             if "compaction" in response_text.lower() or "back from" in response_text.lower():
+                compact_count += 1
                 print("\n" + "=" * 60)
-                print("🎉 COMPACT DETECTED! Alpha mentioned compaction.")
+                print(f"🎉 COMPACT #{compact_count} DETECTED! Alpha mentioned compaction.")
                 print("=" * 60)
-                print(f"\nFull response:\n{response_text}")
-                break
+                print(f"\nFull response:\n{response_text[:1000]}...")
+                print("\n" + "=" * 60)
+                print("Continuing to test multiple compactions...")
+                print("=" * 60)
+                # DON'T break - keep going to test multiple compacts!
 
-    print("\n" + "-" * 60)
-    print("Test complete. Check Logfire for compact spans.")
+    print("\n" + "=" * 60)
+    print("TEST COMPLETE")
+    print("=" * 60)
+    print(f"Chunks sent: {num_chunks}")
+    print(f"Compactions detected: {compact_count}")
+    print(f"Total tokens sent: ~{total_tokens_sent:,}")
+    print("Check Logfire for compact spans.")
 
 
 if __name__ == "__main__":
-    asyncio.run(run_stress_test())
+    # Allow num_chunks as command-line argument
+    num_chunks = DEFAULT_NUM_CHUNKS
+    if len(sys.argv) > 1:
+        try:
+            num_chunks = int(sys.argv[1])
+        except ValueError:
+            print(f"Usage: {sys.argv[0]} [num_chunks]")
+            print(f"  Default: {DEFAULT_NUM_CHUNKS} chunks")
+            sys.exit(1)
+
+    asyncio.run(run_stress_test(num_chunks))
