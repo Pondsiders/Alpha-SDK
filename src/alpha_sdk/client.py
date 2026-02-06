@@ -40,6 +40,7 @@ from claude_agent_sdk.types import (
     ToolResultBlock,
 )
 
+from .agents import load_agents
 from .archive import archive_turn
 from .compact_proxy import CompactProxy, TokenCountCallback
 from .memories.recall import recall
@@ -802,6 +803,9 @@ class AlphaClient:
             ]
         }
 
+        # Load Alpha's agents from the SDK's bundled agent files
+        agents = load_agents()
+
         # Build options with our system prompt
         options_kwargs = {
             "cwd": self.cwd,
@@ -813,6 +817,7 @@ class AlphaClient:
             "resume": session_id,
             "permission_mode": self.permission_mode,
             "hooks": hooks,
+            "agents": agents,
         }
         options = ClaudeAgentOptions(**options_kwargs)
 
