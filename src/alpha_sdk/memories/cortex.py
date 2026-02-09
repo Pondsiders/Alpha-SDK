@@ -11,6 +11,7 @@ from typing import Any
 import logfire
 
 from .embeddings import embed_document, embed_query, EmbeddingError
+from .images import create_thumbnail
 from .db import (
     store_memory,
     search_memories,
@@ -43,6 +44,7 @@ async def store(
     memory: str,
     tags: list[str] | None = None,
     timezone: str | None = None,
+    image: str | None = None,
 ) -> dict[str, Any] | None:
     """Store a memory in Cortex.
 
@@ -50,14 +52,26 @@ async def store(
         memory: The memory content to store
         tags: Optional tags for organization
         timezone: Timezone where the memory was captured
+        image: Optional path to an image to attach (will be thumbnailed)
 
     Returns:
-        Dict with id and created_at, or None on failure
+        Dict with id, created_at, and optionally thumbnail_path; or None on failure
     """
     with logfire.span("cortex.store", memory_preview=memory[:50]) as span:
         try:
             # Generate embedding
             embedding = await embed_document(memory)
+
+            # Process image if provided — create thumbnail, store path
+            thumbnail_path = None
+            if image:
+                thumbnail_path = create_thumbnail(image)
+                if thumbnail_path:
+                    span.set_attribute("image_attached", True)
+                    span.set_attribute("thumbnail_path", thumbnail_path)
+                    logfire.info(f"Image attached: {image} → {thumbnail_path}")
+                else:
+                    logfire.warning(f"Image thumbnail failed for: {image}")
 
             # Store in database
             memory_id, created_at = await store_memory(
@@ -65,11 +79,15 @@ async def store(
                 embedding=embedding,
                 tags=tags,
                 timezone_str=timezone,
+                image_path=thumbnail_path,
             )
 
             span.set_attribute("memory_id", memory_id)
             logfire.info(f"Memory stored: #{memory_id}")
-            return {"id": memory_id, "created_at": created_at.isoformat()}
+            result = {"id": memory_id, "created_at": created_at.isoformat()}
+            if thumbnail_path:
+                result["thumbnail_path"] = thumbnail_path
+            return result
 
         except EmbeddingError as e:
             logfire.error("Embedding failed during store", error=str(e))
@@ -128,12 +146,15 @@ async def search(
             memories = []
             for item in results:
                 metadata = item.get("metadata", {})
-                memories.append({
+                mem = {
                     "id": item["id"],
                     "content": item["content"],
                     "created_at": metadata.get("created_at", ""),
                     "score": item.get("score"),
-                })
+                }
+                if metadata.get("image_path"):
+                    mem["image_path"] = metadata["image_path"]
+                memories.append(mem)
 
             span.set_attribute("result_count", len(memories))
             logfire.debug("Cortex search complete", query_preview=query[:30], results=len(memories))
@@ -165,11 +186,14 @@ async def recent(limit: int = 10, hours: int = 24) -> list[dict[str, Any]]:
             memories = []
             for item in results:
                 metadata = item.get("metadata", {})
-                memories.append({
+                mem = {
                     "id": item["id"],
                     "content": item["content"],
                     "created_at": metadata.get("created_at", ""),
-                })
+                }
+                if metadata.get("image_path"):
+                    mem["image_path"] = metadata["image_path"]
+                memories.append(mem)
 
             span.set_attribute("result_count", len(memories))
             logfire.debug("Cortex recent complete", results=len(memories))
@@ -195,12 +219,15 @@ async def get(memory_id: int) -> dict[str, Any] | None:
             return None
 
         metadata = result.get("metadata", {})
-        return {
+        mem = {
             "id": result["id"],
             "content": result["content"],
             "created_at": metadata.get("created_at", ""),
             "tags": metadata.get("tags"),
         }
+        if metadata.get("image_path"):
+            mem["image_path"] = metadata["image_path"]
+        return mem
     except Exception as e:
         logfire.error("Cortex get failed", error=str(e))
         return None

@@ -43,6 +43,7 @@ from claude_agent_sdk.types import (
 
 from .archive import archive_turn
 from .compact_proxy import CompactProxy, TokenCountCallback
+from .memories.images import load_thumbnail_base64, process_inline_image
 from .memories.recall import recall
 from .memories.suggest import suggest
 from .sessions import list_sessions, get_session_path, get_sessions_dir, SessionInfo
@@ -377,12 +378,32 @@ class AlphaClient:
             # Recall memories for this prompt
             memories = await recall(prompt_text, self._current_session_id or "new")
             if memories:
+                images_injected = 0
                 for mem in memories:
                     content_blocks.append({
                         "type": "text",
                         "text": _format_memory(mem)
                     })
+                    # Mind's Eye: if memory has an attached image, inject it
+                    if mem.get("image_path"):
+                        image_data = load_thumbnail_base64(mem["image_path"])
+                        if image_data:
+                            content_blocks.append({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/jpeg",
+                                    "data": image_data,
+                                },
+                            })
+                            images_injected += 1
+                            logfire.debug(
+                                f"Image injected for memory #{mem['id']}",
+                                image_path=mem["image_path"],
+                            )
                 span.set_attribute("memories_recalled", len(memories))
+                if images_injected:
+                    span.set_attribute("images_injected", images_injected)
 
             # Add PSO-8601 timestamp right before user's prompt
             # Format: "[Sent Thu Feb 5 2026, 8:03 AM]"
@@ -392,11 +413,13 @@ class AlphaClient:
                 "text": f"[Sent {sent_at}]"
             })
 
-            # Add the user's actual prompt
+            # Add the user's actual prompt, processing any inline images
             if isinstance(prompt, str):
                 content_blocks.append({"type": "text", "text": prompt})
             else:
-                content_blocks.extend(prompt)
+                # Process content blocks — resize inline images for safety & token efficiency
+                processed_prompt = self._process_inline_images(prompt)
+                content_blocks.extend(processed_prompt)
 
             span.set_attribute("content_blocks", len(content_blocks))
 
@@ -742,6 +765,61 @@ class AlphaClient:
         count = len(self._pending_memorables)
         self._pending_memorables = []
         return count
+
+    # -------------------------------------------------------------------------
+    # Image Processing
+    # -------------------------------------------------------------------------
+
+    def _process_inline_images(self, content_blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Process inline images in content blocks.
+
+        For each image block:
+        1. Resize to 768px long edge JPEG (safety valve + token efficiency)
+        2. Save thumbnail to Alpha-Home/images/thumbnails/
+        3. Replace original base64 with thumbnail base64
+        4. Add a text block with the thumbnail path (so Alpha can attach it to memories)
+
+        This prevents Request Too Large errors from retina screenshots
+        and makes every pasted image available for `cortex store --image`.
+        """
+        processed: list[dict[str, Any]] = []
+        images_processed = 0
+
+        for block in content_blocks:
+            if block.get("type") == "image":
+                source = block.get("source", {})
+                if source.get("type") == "base64" and source.get("data"):
+                    # Process the image
+                    result = process_inline_image(
+                        source["data"],
+                        media_type=source.get("media_type", "image/png"),
+                    )
+                    if result:
+                        new_base64, thumb_path = result
+                        # Replace with resized image
+                        processed.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",  # Always JPEG now
+                                "data": new_base64,
+                            },
+                        })
+                        # Add path hint so Alpha can use it with cortex store
+                        processed.append({
+                            "type": "text",
+                            "text": f"[Image saved: {thumb_path}]",
+                        })
+                        images_processed += 1
+                        continue
+                    # Fall through to original if processing fails
+
+            processed.append(block)
+
+        if images_processed:
+            logfire.info(f"Processed {images_processed} inline image(s)")
+
+        return processed
 
     # -------------------------------------------------------------------------
     # Internal

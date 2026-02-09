@@ -62,8 +62,12 @@ def store_cmd(
         Optional[str],
         typer.Option("--tags", "-t", help="Comma-separated tags")
     ] = None,
+    image: Annotated[
+        Optional[str],
+        typer.Option("--image", "-i", help="Path to image to attach (will be thumbnailed)")
+    ] = None,
 ):
-    """Store a new memory."""
+    """Store a new memory, optionally with an attached image."""
     # Read content from stdin if "-" or no argument
     if content == "-" or (content is None and not sys.stdin.isatty()):
         content = sys.stdin.read().strip()
@@ -75,13 +79,16 @@ def store_cmd(
     tag_list = [t.strip() for t in tags.split(",")] if tags else None
 
     async def do_store():
-        result = await store(content, tags=tag_list, timezone=get_local_timezone())
+        result = await store(content, tags=tag_list, timezone=get_local_timezone(), image=image)
         return result
 
     result = run_async(do_store())
 
     if result:
-        console.print(f"[green]✓ Memory stored[/green] (id: {result['id']})")
+        msg = f"[green]✓ Memory stored[/green] (id: {result['id']})"
+        if result.get("thumbnail_path"):
+            msg += f" [dim][image: {result['thumbnail_path']}][/dim]"
+        console.print(msg)
     else:
         console.print("[red]Error storing memory[/red]")
         raise typer.Exit(1)

@@ -40,20 +40,34 @@ def create_cortex_server(
     @tool(
         "store",
         "Store a memory in Cortex. Use this to remember important moments, realizations, or anything worth preserving.",
-        {"memory": str}
+        {
+            "type": "object",
+            "properties": {
+                "memory": {"type": "string", "description": "The memory text content"},
+                "image": {"type": "string", "description": "Optional path to an image to attach (will be thumbnailed to 768px JPEG)"},
+            },
+            "required": ["memory"],
+        },
     )
     async def store_memory(args: dict[str, Any]) -> dict[str, Any]:
-        """Store a memory and clear the memorables buffer."""
+        """Store a memory and clear the memorables buffer.
+
+        Args (via tool call):
+            memory: The memory text content
+            image: Optional path to an image to attach (will be thumbnailed to 768px JPEG)
+        """
         memory = args["memory"]
+        image = args.get("image")
         session_id = get_session_id() if get_session_id else None
 
         with logfire.span(
             "mcp.cortex.store",
             memory_len=len(memory),
+            has_image=image is not None,
             session_id=session_id[:8] if session_id else "none"
         ):
             try:
-                result = await cortex_store(memory)
+                result = await cortex_store(memory, image=image)
 
                 if result is None:
                     return {"content": [{"type": "text", "text": "Error storing memory"}]}
@@ -66,6 +80,8 @@ def create_cortex_server(
 
                 # Build response
                 response_text = f"Memory stored (id: {memory_id})"
+                if result.get("thumbnail_path"):
+                    response_text += f" [image: {result['thumbnail_path']}]"
                 if cleared > 0:
                     response_text += f" - cleared {cleared} pending suggestion(s)"
 
@@ -98,7 +114,8 @@ def create_cortex_server(
                     score = mem.get("score", 0)
                     content = mem.get("content", "")
                     created = mem.get("created_at", "")[:10]  # Just the date
-                    lines.append(f"[{score:.2f}] ({created}) {content}\n")
+                    image_flag = " 📷" if mem.get("image_path") else ""
+                    lines.append(f"[{score:.2f}] ({created}{image_flag}) {content}\n")
 
                 logfire.info("Search complete", results=len(memories))
                 return {"content": [{"type": "text", "text": "\n".join(lines)}]}
@@ -128,7 +145,8 @@ def create_cortex_server(
                 for mem in memories:
                     content = mem.get("content", "")
                     created = mem.get("created_at", "")[:16]  # Date and time
-                    lines.append(f"({created}) {content}\n")
+                    image_flag = " 📷" if mem.get("image_path") else ""
+                    lines.append(f"({created}{image_flag}) {content}\n")
 
                 logfire.info("Recent complete", results=len(memories))
                 return {"content": [{"type": "text", "text": "\n".join(lines)}]}

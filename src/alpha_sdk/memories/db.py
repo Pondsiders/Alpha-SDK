@@ -47,8 +47,17 @@ async def store_memory(
     embedding: list[float],
     tags: list[str] | None = None,
     timezone_str: str | None = None,
+    image_path: str | None = None,
 ) -> tuple[int, datetime]:
-    """Store a new memory. Returns (id, created_at)."""
+    """Store a new memory. Returns (id, created_at).
+
+    Args:
+        content: The memory text
+        embedding: The embedding vector
+        tags: Optional tags for organization
+        timezone_str: Timezone where memory was captured
+        image_path: Optional path to an associated image thumbnail
+    """
     pool = await get_pool()
     created_at = datetime.now(timezone.utc)
     metadata = {
@@ -57,6 +66,8 @@ async def store_memory(
     }
     if tags:
         metadata["tags"] = tags
+    if image_path:
+        metadata["image_path"] = image_path
 
     with logfire.span("cortex.db.store", content_preview=content[:50]) as span:
         async with pool.acquire() as conn:

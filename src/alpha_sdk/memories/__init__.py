@@ -8,6 +8,7 @@ Cortex is now fully absorbed into alpha_sdk:
 """
 
 from .cortex import store, search, recent, get, forget, health, close, EmbeddingError
+from .images import create_thumbnail, load_thumbnail_base64, process_inline_image
 from .recall import recall
 from .suggest import suggest
 
@@ -21,6 +22,10 @@ __all__ = [
     "health",
     "close",
     "EmbeddingError",
+    # Image processing
+    "create_thumbnail",
+    "load_thumbnail_base64",
+    "process_inline_image",
     # Higher-level functions
     "recall",
     "suggest",
