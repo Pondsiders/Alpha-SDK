@@ -48,6 +48,8 @@ from .memories.recall import recall
 from .memories.suggest import suggest
 from .sessions import list_sessions, get_session_path, get_sessions_dir, SessionInfo
 from .system_prompt import assemble
+from .tools.cortex import create_cortex_server
+from .tools.forge import create_forge_server
 from .system_prompt.soul import get_soul
 
 # The Alpha Plugin — agents, skills, and tools bundled in a sibling repo
@@ -902,13 +904,36 @@ class AlphaClient:
             ]
         }
 
+        # Build MCP servers — internal + consumer-provided (consumer wins on conflict)
+        internal_servers = {
+            "cortex": create_cortex_server(
+                get_session_id=lambda: self._current_session_id,
+                clear_memorables=self.clear_memorables,
+            ),
+            "forge": create_forge_server(),
+        }
+        # Consumer-provided servers override internal ones with the same name
+        merged_servers = {**internal_servers, **self.mcp_servers}
+
+        # Auto-add internal MCP tool names to allowed_tools
+        internal_tool_names = [
+            "mcp__cortex__store",
+            "mcp__cortex__search",
+            "mcp__cortex__recent",
+            "mcp__forge__imagine",
+        ]
+        allowed = list(self.allowed_tools or [])
+        for tool_name in internal_tool_names:
+            if tool_name not in allowed:
+                allowed.append(tool_name)
+
         # Build options with our system prompt
         options_kwargs = {
             "cwd": self.cwd,
             "system_prompt": self._system_prompt,  # Just the soul!
             "model": self.ALPHA_MODEL,  # Alpha IS this model
-            "allowed_tools": self.allowed_tools or [],
-            "mcp_servers": self.mcp_servers,
+            "allowed_tools": allowed,
+            "mcp_servers": merged_servers,
             "include_partial_messages": self.include_partial_messages,
             "resume": session_id,
             "permission_mode": self.permission_mode,
