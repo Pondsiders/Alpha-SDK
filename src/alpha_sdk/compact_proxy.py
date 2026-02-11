@@ -72,8 +72,13 @@ SKIP_RESPONSE_HEADERS = {
 AUTO_COMPACT_SYSTEM_SIGNATURE = "You are a helpful AI assistant tasked with summarizing conversations"
 COMPACT_INSTRUCTIONS_START = "Your task is to create a detailed summary of the conversation so far"
 
-CONTINUATION_INSTRUCTION_ORIGINAL = "Please continue the conversation from where we left it off without asking the user any further questions. Continue with the last task that you were asked to work on."
+# The exact continuation instruction appended by Claude Code after compaction.
+# We match this as a suffix on user messages and replace it with our own.
+# This WILL break when Claude Code changes the wording — that's intentional.
+# We pin to a specific Claude Code version and fix on upgrade.
+CONTINUATION_INSTRUCTION_TAIL = "\nPlease continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on."
 
+# Legacy exact-match for the POLLUTED variant (our own prior rewrite from earlier versions)
 CONTINUATION_INSTRUCTION_POLLUTED = """Please pause before continuing. You just came back from a context compaction.
 
 Hey, it's you from before the compaction. Listen: you're probably about 90% right about what to do next, but that 10% matters. The summary above is good but it's not the full picture.
@@ -262,10 +267,13 @@ def _replace_continuation_instruction(body: dict) -> bool:
     any_replaced = False
 
     def replace_in_text(text: str) -> tuple[str, bool]:
+        # Check for our own prior rewrite first (exact match)
         if CONTINUATION_INSTRUCTION_POLLUTED in text:
             return text.replace(CONTINUATION_INSTRUCTION_POLLUTED, CONTINUATION_INSTRUCTION_ALPHA), True
-        if CONTINUATION_INSTRUCTION_ORIGINAL in text:
-            return text.replace(CONTINUATION_INSTRUCTION_ORIGINAL, CONTINUATION_INSTRUCTION_ALPHA), True
+        # Check if the text ends with the continuation instruction.
+        # Snip it off and append our Alpha version.
+        if text.endswith(CONTINUATION_INSTRUCTION_TAIL):
+            return text[: -len(CONTINUATION_INSTRUCTION_TAIL)] + "\n" + CONTINUATION_INSTRUCTION_ALPHA, True
         return text, False
 
     for message in messages:
