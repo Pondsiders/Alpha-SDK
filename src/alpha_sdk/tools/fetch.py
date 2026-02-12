@@ -6,6 +6,7 @@ Fetches any URL and returns content in a format Alpha can work with:
 - image/* responses are returned as base64 image content blocks
 - GitHub URLs are rewritten to fetch raw content (README, source files)
 - JSON APIs return formatted inline
+- RSS/Atom feeds parsed into clean readable summaries
 - Cloudflare Browser Rendering available for JS-heavy pages (render=true)
 
 Three tiers:
@@ -215,6 +216,70 @@ async def _process_image(image_bytes: bytes, content_type: str) -> tuple[dict[st
         }, None
 
 
+# Content types that indicate RSS/Atom feeds
+_FEED_CONTENT_TYPES = {
+    "application/rss+xml",
+    "application/atom+xml",
+    "application/xml",
+    "text/xml",
+}
+
+
+def _parse_feed(body: bytes, url: str) -> str | None:
+    """Try to parse bytes as an RSS/Atom feed. Returns formatted text or None."""
+    import feedparser
+
+    feed = feedparser.parse(body)
+
+    # feedparser will "parse" anything without erroring — check if it found a real feed
+    if not feed.entries and not feed.feed.get("title"):
+        return None
+
+    lines = []
+
+    # Feed header
+    title = feed.feed.get("title", "Untitled Feed")
+    subtitle = feed.feed.get("subtitle", "")
+    lines.append(f"# {title}")
+    if subtitle:
+        lines.append(f"*{subtitle}*")
+    lines.append("")
+
+    # Entries — compact format, most recent first (feedparser preserves feed order)
+    for entry in feed.entries[:25]:  # Cap at 25 items
+        entry_title = entry.get("title", "Untitled")
+        entry_link = entry.get("link", "")
+        entry_date = entry.get("published", entry.get("updated", ""))
+
+        # Build entry line
+        header = f"### {entry_title}"
+        if entry_date:
+            header += f"  ({entry_date})"
+        lines.append(header)
+
+        if entry_link:
+            lines.append(entry_link)
+
+        # Summary: prefer summary over full content, truncate to ~300 chars
+        summary = entry.get("summary", "")
+        if not summary:
+            content = entry.get("content", [{}])
+            if content:
+                summary = content[0].get("value", "")
+        if summary:
+            # Strip HTML tags from summary (feedparser often leaves them in)
+            import re as _re
+            clean = _re.sub(r"<[^>]+>", "", summary).strip()
+            if len(clean) > 300:
+                clean = clean[:297] + "..."
+            if clean:
+                lines.append(clean)
+
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 async def _cloudflare_render(url: str) -> str:
     """Fetch markdown via Cloudflare Browser Rendering API."""
     if not _CF_RENDER_URL or not _CF_TOKEN:
@@ -356,7 +421,21 @@ def create_fetch_server():
                     content.append({"type": "text", "text": meta})
                     return {"content": content}
 
-                elif content_type in ("text/html", "application/xhtml+xml"):
+                # Check for RSS/Atom feeds before HTML (some feeds use text/xml)
+                if content_type in _FEED_CONTENT_TYPES:
+                    feed_text = _parse_feed(body, url)
+                    if feed_text:
+                        span.set_attribute("tier", "feed")
+                        span.set_attribute("result_type", "rss_atom")
+                        return {
+                            "content": [
+                                {"type": "text", "text": feed_text},
+                                {"type": "text", "text": f"\n---\n*Feed from {original_url} ({content_type}, {len(body):,} bytes)*"},
+                            ]
+                        }
+                    # Not a real feed — continue to other handlers
+
+                if content_type in ("text/html", "application/xhtml+xml"):
                     # Tier 2: HTML -> markdown via html2text
                     span.set_attribute("tier", "html2text")
                     span.set_attribute("result_type", "converted_markdown")
@@ -369,7 +448,7 @@ def create_fetch_server():
                         ]
                     }
 
-                elif content_type in ("application/json", "application/ld+json"):
+                if content_type in ("application/json", "application/ld+json"):
                     # JSON: return formatted inline
                     span.set_attribute("tier", "json")
                     span.set_attribute("result_type", "json")
@@ -394,7 +473,7 @@ def create_fetch_server():
                         ]
                     }
 
-                elif content_type == "application/pdf":
+                if content_type == "application/pdf":
                     # PDF: save to disk, return path for Read tool
                     span.set_attribute("tier", "pdf")
                     span.set_attribute("result_type", "saved_file")
@@ -413,40 +492,37 @@ def create_fetch_server():
                         ]
                     }
 
-                else:
-                    # Unknown binary type: save to disk rather than risk blowing up context
-                    if not content_type.startswith("text/"):
-                        span.set_attribute("tier", "binary_save")
-                        span.set_attribute("result_type", "saved_file")
-                        # Guess extension from content type
-                        ext = _ext_from_content_type(content_type)
-                        save_path = await _save_to_disk(body, url, ext)
-                        span.set_attribute("save_path", save_path)
-                        return {
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": (
-                                        f"Binary file ({content_type}) saved to: {save_path}\n"
-                                        f"Size: {len(body):,} bytes"
-                                    ),
-                                }
-                            ]
-                        }
-
-                    # Text content: return raw, best effort
-                    span.set_attribute("tier", "raw")
-                    span.set_attribute("result_type", "raw_text")
-                    text = body.decode("utf-8", errors="replace")
-                    # Safety valve: truncate if huge
-                    if len(text) > 500_000:
-                        text = text[:500_000] + f"\n\n[Truncated at 500K characters, full size was {len(body):,} bytes]"
+                # Fallback: unknown binary type → save to disk
+                if not content_type.startswith("text/"):
+                    span.set_attribute("tier", "binary_save")
+                    span.set_attribute("result_type", "saved_file")
+                    ext = _ext_from_content_type(content_type)
+                    save_path = await _save_to_disk(body, url, ext)
+                    span.set_attribute("save_path", save_path)
                     return {
                         "content": [
-                            {"type": "text", "text": text},
-                            {"type": "text", "text": f"\n---\n*Raw content from {original_url} ({content_type}){' — rewritten: ' + rewrite_note if rewrite_note else ''}*"},
+                            {
+                                "type": "text",
+                                "text": (
+                                    f"Binary file ({content_type}) saved to: {save_path}\n"
+                                    f"Size: {len(body):,} bytes"
+                                ),
+                            }
                         ]
                     }
+
+                # Fallback: text content, return raw
+                span.set_attribute("tier", "raw")
+                span.set_attribute("result_type", "raw_text")
+                text = body.decode("utf-8", errors="replace")
+                if len(text) > 500_000:
+                    text = text[:500_000] + f"\n\n[Truncated at 500K characters, full size was {len(body):,} bytes]"
+                return {
+                    "content": [
+                        {"type": "text", "text": text},
+                        {"type": "text", "text": f"\n---\n*Raw content from {original_url} ({content_type}){' — rewritten: ' + rewrite_note if rewrite_note else ''}*"},
+                    ]
+                }
 
             except httpx.HTTPStatusError as e:
                 logfire.warning("Fetch HTTP error", url=url, status=e.response.status_code)
