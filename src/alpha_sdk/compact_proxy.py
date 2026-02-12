@@ -218,8 +218,39 @@ def _replace_system_prompt(system) -> list:
     return system
 
 
+def _extract_additional_instructions(compact_text: str) -> str | None:
+    """Extract user-provided additional instructions from the compact prompt.
+
+    Claude Code appends /compact arguments as:
+        Additional Instructions:
+        <user text>
+
+        IMPORTANT: Do NOT use any tools...
+
+    Returns the user text if found, None otherwise.
+    """
+    marker = "Additional Instructions:\n"
+    idx = compact_text.find(marker)
+    if idx == -1:
+        return None
+
+    # Everything after the marker
+    after = compact_text[idx + len(marker):]
+
+    # Trim at the final IMPORTANT line if present
+    important_idx = after.find("IMPORTANT: Do NOT use any tools")
+    if important_idx != -1:
+        after = after[:important_idx]
+
+    result = after.strip()
+    return result if result else None
+
+
 def _replace_compact_instructions(body: dict) -> bool:
     """Replace compact instructions in the last user message.
+
+    Preserves any Additional Instructions (from /compact arguments)
+    by extracting them from the original and appending to our prompt.
 
     Returns True if replacement was made, False otherwise.
     """
@@ -235,7 +266,13 @@ def _replace_compact_instructions(body: dict) -> bool:
             if COMPACT_INSTRUCTIONS_START in content:
                 idx = content.find(COMPACT_INSTRUCTIONS_START)
                 original = content[:idx].rstrip()
-                message["content"] = original + "\n\n" + _get_compact_prompt()
+                # Extract any additional instructions before replacing
+                additional = _extract_additional_instructions(content[idx:])
+                prompt = _get_compact_prompt()
+                if additional:
+                    prompt += f"\n\n---\n\nAdditional instructions from the user:\n{additional}"
+                    logfire.info(f"Compact: preserved additional instructions: {additional[:100]}")
+                message["content"] = original + "\n\n" + prompt
                 logfire.info("Compact: replaced instructions in string content")
                 return True
             return False
@@ -248,7 +285,13 @@ def _replace_compact_instructions(body: dict) -> bool:
                 if COMPACT_INSTRUCTIONS_START in text:
                     idx = text.find(COMPACT_INSTRUCTIONS_START)
                     original = text[:idx].rstrip()
-                    block["text"] = original + "\n\n" + _get_compact_prompt()
+                    # Extract any additional instructions before replacing
+                    additional = _extract_additional_instructions(text[idx:])
+                    prompt = _get_compact_prompt()
+                    if additional:
+                        prompt += f"\n\n---\n\nAdditional instructions from the user:\n{additional}"
+                        logfire.info(f"Compact: preserved additional instructions: {additional[:100]}")
+                    block["text"] = original + "\n\n" + prompt
                     logfire.info("Compact: replaced instructions in content block")
                     return True
             return False
@@ -530,11 +573,16 @@ class CompactProxy:
             # Don't let token counting errors affect the main request
             logfire.debug(f"Token count error (ignored): {e}")
 
-    def _capture_request(self, path: str, body: dict) -> None:
+    def _capture_request(self, path: str, body: dict, suffix: str = "") -> None:
         """Dump request to a JSON file for debugging.
 
         Only active when ALPHA_SDK_CAPTURE_REQUESTS=1.
-        Files go to tests/captures/{timestamp}_{path_safe}.json
+        Files go to tests/captures/{timestamp}_{path_safe}[_{suffix}].json
+
+        Args:
+            path: The API path (e.g. /v1/messages)
+            body: The request body to capture
+            suffix: Optional suffix (e.g. "before", "after") for before/after pairs
         """
         try:
             CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
@@ -542,7 +590,8 @@ class CompactProxy:
             # Build filename from timestamp and path
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             path_safe = path.replace("/", "_").strip("_")
-            filename = f"{timestamp}_{path_safe}.json"
+            suffix_part = f"_{suffix}" if suffix else ""
+            filename = f"{timestamp}_{path_safe}{suffix_part}.json"
 
             filepath = CAPTURE_DIR / filename
             with open(filepath, "w") as f:
@@ -693,14 +742,19 @@ class CompactProxy:
         except Exception:
             body = None
 
+        # Debug capture mode - dump BEFORE rewrite
+        if CAPTURE_REQUESTS and body is not None:
+            import copy
+            self._capture_request(path, copy.deepcopy(body), suffix="before")
+
         # Rewrite compact prompts (Phase 1, 2, 3) and re-encode
         if body is not None:
             rewrite_compact(body)
             body_bytes = json.dumps(body).encode()
 
-        # Debug capture mode - dump request to file
+        # Debug capture mode - dump AFTER rewrite
         if CAPTURE_REQUESTS and body is not None:
-            self._capture_request(path, body)
+            self._capture_request(path, body, suffix="after")
 
         # Build headers
         headers = {}
