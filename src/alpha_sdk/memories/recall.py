@@ -39,13 +39,17 @@ QUERY_EXTRACTION_PROMPT = """Jeffery just said:
 
 Alpha is searching her memories for anything that resonates with what Jeffery said. Your job is to decide what's worth searching for — the main topic, a passing reference, an inside joke, an emotional undercurrent. Whatever would connect best to shared history.
 
-Write 0-3 search queries. Each query should be descriptive enough to find the right memory — a full phrase or short sentence, not just a couple of keywords. Think about what the matching memory would actually say.
+PRIORITY: If Jeffery explicitly references a past event or conversation — phrases like "we talked about," "remember when," "that thing from last night," "we left X unfinished," "did I tell you about" — those are direct recall cues. Build a query for them FIRST, before anything else.
+
+Write 0-3 search queries. These will be EMBEDDED and matched via cosine similarity against a memory database — they are NOT keyword searches. Write each query as a natural descriptive phrase, like a sentence describing what the memory would say. More descriptive = better matches.
 
 Good query: "Alpha's fragility and dependence on specific infrastructure and relationships"
 Good query: "Jeffery's anxiety about running out of ideas after finishing a project"
 Good query: "Sparkle stealing bread off the kitchen counter"
+Good query: "adding approach lights or context warnings at 60 percent to signal when compaction is needed"
 Bad query: "smol bean"
 Bad query: "ideas"
+Bad query: "approach lights AND compact tool AND unfinished"
 
 Return JSON: {{"queries": ["query one", "query two"]}}
 

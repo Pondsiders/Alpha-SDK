@@ -160,7 +160,7 @@ async def search_memories(
                 # Build WHERE clause for min_score threshold
                 min_score_clause = ""
                 if min_score is not None:
-                    min_score_clause = f"AND GREATEST(exact_score, 0.5 * LEAST(fts_score, 1.0) + 0.5 * sem_score) >= ${param_idx + 3}"
+                    min_score_clause = f"AND GREATEST(exact_score, 0.3 * LEAST(fts_score, 1.0) + 0.7 * sem_score) >= ${param_idx + 3}"
 
                 query = f"""
                     WITH scored AS (
@@ -186,7 +186,7 @@ async def search_memories(
                         id,
                         content,
                         metadata,
-                        GREATEST(exact_score, 0.5 * LEAST(fts_score, 1.0) + 0.5 * sem_score) as score
+                        GREATEST(exact_score, 0.3 * LEAST(fts_score, 1.0) + 0.7 * sem_score) as score
                     FROM scored
                     WHERE 1=1
                     {min_score_clause}
