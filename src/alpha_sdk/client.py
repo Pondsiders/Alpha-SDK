@@ -717,14 +717,35 @@ class AlphaClient:
                             compact_cmd,
                             session_id=self._current_session_id or "new",
                         )
-                        async for _ in self._sdk_client.receive_response():
-                            pass  # Compact response consumed silently
 
-                        logfire.info("Hand-off: compact complete, building wake-up")
+                        # Capture the compaction summary from the response.
+                        # This is the letter past-me wrote to future-me —
+                        # without it, future-me wakes up with no idea what happened.
+                        compact_summary_parts: list[str] = []
+                        async for msg in self._sdk_client.receive_response():
+                            if isinstance(msg, AssistantMessage):
+                                for block in msg.content:
+                                    if isinstance(block, TextBlock):
+                                        compact_summary_parts.append(block.text)
+
+                        compact_summary = "\n".join(compact_summary_parts)
+                        logfire.info(
+                            "Hand-off: compact complete, building wake-up",
+                            summary_length=len(compact_summary),
+                            summary_preview=compact_summary[:200],
+                        )
 
                         # Step 2: Build orientation for fresh context
                         self._orientation_blocks = await self._build_orientation()
                         wake_up_blocks: list[dict[str, Any]] = []
+
+                        # The compaction summary goes FIRST — it's the most
+                        # important thing future-me needs to read
+                        if compact_summary:
+                            wake_up_blocks.append({
+                                "type": "text",
+                                "text": compact_summary,
+                            })
 
                         if self._orientation_blocks:
                             wake_up_blocks.extend(self._orientation_blocks)
@@ -773,6 +794,9 @@ class AlphaClient:
                         # ── gen_ai attributes for the wake-up turn ──
                         # These make the hand-off visible in Logfire's Model Run panel:
                         # system instructions, input messages, output messages, tokens, etc.
+                        if compact_summary:
+                            handoff_span.set_attribute("compact_summary", compact_summary[:5000])
+                            handoff_span.set_attribute("compact_summary_length", len(compact_summary))
                         handoff_span.set_attribute("gen_ai.system", "anthropic")
                         handoff_span.set_attribute("gen_ai.operation.name", "chat")
                         handoff_span.set_attribute("gen_ai.request.model", self.ALPHA_MODEL)
