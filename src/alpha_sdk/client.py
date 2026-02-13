@@ -947,6 +947,16 @@ class AlphaClient:
         self._pending_compact = instructions
         logfire.info(f"Hand-off requested: {instructions[:100]}")
 
+    async def _store_memory_for_handoff(self, memory: str) -> dict:
+        """Store a memory on behalf of the hand-off tool.
+
+        The hand-off tool requires a last memory before lights-out.
+        This wraps cortex.store() so the tool doesn't need to import it.
+        """
+        from .memories.cortex import store
+        result = await store(memory)
+        return result or {"id": "failed"}
+
     def clear_memorables(self) -> int:
         """Clear pending memorables and return how many were cleared.
 
@@ -1102,6 +1112,7 @@ class AlphaClient:
             "forge": create_forge_server(),
             "handoff": create_handoff_server(
                 on_handoff=self.request_compact,
+                store_memory=self._store_memory_for_handoff,
             ),
         }
         # Consumer-provided servers override internal ones with the same name
