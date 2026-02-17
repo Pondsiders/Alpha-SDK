@@ -25,4 +25,4 @@ __all__ = [
     # Observability
     "configure_observability",
 ]
-__version__ = "0.3.0"  # Compact proxy for prompt rewriting
+__version__ = "0.5.2"  # Pre-Rosemary fork cleanup

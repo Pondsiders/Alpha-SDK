@@ -54,33 +54,33 @@ Why have each client implement this separately? Why have services on alpha-pi wh
 ## Architecture
 
 ```
-alpha_sdk/
+src/alpha_sdk/
 ├── __init__.py              # Exports AlphaClient
 ├── client.py                # AlphaClient - the main wrapper
 ├── compact_proxy.py         # Localhost proxy: compact rewriting + token counting
 ├── archive.py               # Conversation archiving to Postgres
 ├── sessions.py              # Session discovery and management
 ├── observability.py         # Logfire setup, span creation
+├── cli/
+│   └── cortex.py            # cortex CLI command
 ├── system_prompt/
-│   ├── __init__.py          # assemble() - builds the full system prompt
-│   ├── soul.py              # The soul doc (from file)
-│   ├── capsules.py          # Yesterday, last night, today (from Postgres)
-│   ├── here.py              # Client, hostname, weather, astronomy
+│   ├── assemble.py          # assemble() - builds the full system prompt
+│   ├── soul.py              # The soul doc (from git repo)
+│   ├── capsules.py          # Yesterday, last night (from Postgres)
+│   ├── here.py              # Client, hostname, weather, narrative orientation
 │   ├── context.py           # ALPHA.md files (autoload + hints)
 │   ├── calendar.py          # Events (from Redis)
 │   └── todos.py             # Todos (from Redis)
 ├── memories/
-│   ├── __init__.py
 │   ├── db.py                # Direct Postgres operations (hybrid search)
 │   ├── cortex.py            # store, search, recent (high-level API)
-│   ├── embeddings.py        # Embedding generation via Forge
-│   ├── images.py            # Mind's Eye (image storage)
+│   ├── embeddings.py        # Embedding generation via Ollama
+│   ├── images.py            # Mind's Eye (image storage + thumbnailing)
 │   ├── recall.py            # Smart recall (embedding + Gemma query extraction)
-│   └── suggest.py           # Gemma memorables extraction
+│   └── suggest.py           # Intro — Gemma memorables extraction
 └── tools/
-    ├── __init__.py
     ├── cortex.py            # Cortex MCP server (store/search/recent)
-    ├── fetch.py             # Fetch MCP server (web/image/RSS)
+    ├── fetch.py             # Fetch MCP server (web/image/RSS/YouTube)
     ├── forge.py             # Forge MCP server (imagine)
     └── handoff.py           # Hand-off MCP server
 ```
