@@ -5,11 +5,21 @@ Direct asyncpg access to the cortex database with pgvector.
 
 import json
 import os
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import asyncpg
 import logfire
+
+
+def _escape_pg_regex(text: str) -> str:
+    """Escape special characters for safe use in Postgres regex (~* operator).
+
+    Without this, queries containing *, +, ?, etc. will crash with
+    'invalid regular expression: quantifier operand invalid'.
+    """
+    return re.sub(r'([.*+?^${}()|[\]\\])', r'\\\1', text)
 
 # Configuration from environment
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -157,10 +167,14 @@ async def search_memories(
                 # Three-way search: exact match + full-text + semantic
                 embedding_json = json.dumps(query_embedding)
 
+                # Escape query for Postgres regex (prevents crashes on *, +, etc.)
+                regex_safe = _escape_pg_regex(query_text)
+
                 # Build WHERE clause for min_score threshold
+                # Params: query_text, regex_safe, embedding_json, limit [, min_score]
                 min_score_clause = ""
                 if min_score is not None:
-                    min_score_clause = f"AND GREATEST(exact_score, 0.3 * LEAST(fts_score, 1.0) + 0.7 * sem_score) >= ${param_idx + 3}"
+                    min_score_clause = f"AND GREATEST(exact_score, 0.3 * LEAST(fts_score, 1.0) + 0.7 * sem_score) >= ${param_idx + 4}"
 
                 query = f"""
                     WITH scored AS (
@@ -169,7 +183,7 @@ async def search_memories(
                             content,
                             metadata,
                             -- Exact match: 1.0 if query appears with word boundaries
-                            CASE WHEN content ~* ('\\m' || ${param_idx} || '\\M')
+                            CASE WHEN content ~* ('\\m' || ${param_idx + 1} || '\\M')
                                  THEN 1.0 ELSE 0.0 END as exact_score,
                             -- Full-text ranking (ts_rank returns 0-1ish)
                             COALESCE(
@@ -177,7 +191,7 @@ async def search_memories(
                                 0
                             ) as fts_score,
                             -- Cosine similarity is already 0-1 for normalized vectors
-                            1 - (embedding <=> ${param_idx + 1}::vector) as sem_score
+                            1 - (embedding <=> ${param_idx + 2}::vector) as sem_score
                         FROM cortex.memories
                         WHERE {where_clause}
                           AND embedding IS NOT NULL
@@ -191,9 +205,9 @@ async def search_memories(
                     WHERE 1=1
                     {min_score_clause}
                     ORDER BY score DESC
-                    LIMIT ${param_idx + 2}
+                    LIMIT ${param_idx + 3}
                 """
-                params.extend([query_text, embedding_json, limit])
+                params.extend([query_text, regex_safe, embedding_json, limit])
                 if min_score is not None:
                     params.append(min_score)
 

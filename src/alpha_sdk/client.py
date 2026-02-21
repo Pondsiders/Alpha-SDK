@@ -95,8 +95,8 @@ def _format_memory(memory: dict) -> str:
     # Simple relative time formatting
     relative_time = created_at  # fallback
     try:
-        dt = pendulum.parse(created_at)
-        now = pendulum.now(dt.timezone or "America/Los_Angeles")
+        dt = pendulum.parse(created_at).in_tz("America/Los_Angeles")
+        now = pendulum.now("America/Los_Angeles")
         diff = now.diff(dt)
         if diff.in_days() == 0:
             relative_time = f"today at {dt.format('h:mm A')}"
@@ -198,9 +198,9 @@ class AlphaClient:
         # Hand-off: compact instructions set by the hand-off tool, consumed after stream
         self._pending_compact: str | None = None
 
-        # Approach lights: escalating context warnings at 60% and 70%
+        # Approach lights: escalating context warnings at 65% and 75%
         # Tracks the highest tier warned so we don't repeat the same warning
-        self._approach_warned: int = 0  # 0=none, 1=amber(60%), 2=red(70%)
+        self._approach_warned: int = 0  # 0=none, 1=amber(65%), 2=red(75%)
 
     # -------------------------------------------------------------------------
     # Session Discovery (static methods)
@@ -956,8 +956,8 @@ class AlphaClient:
         """Check context usage and return an approach light warning if threshold crossed.
 
         Two tiers:
-        - Amber (60%): gentle heads-up to start thinking about pausing
-        - Red (70%): stern warning to wrap up or hand off
+        - Amber (65%): gentle heads-up to start thinking about pausing
+        - Red (75%): stern warning to wrap up or hand off
 
         Only fires once per tier (resets after compaction).
         Returns the warning text, or None if no warning needed.
@@ -972,7 +972,7 @@ class AlphaClient:
 
         pct = token_count / context_window
 
-        if pct >= 0.70 and self._approach_warned < 2:
+        if pct >= 0.75 and self._approach_warned < 2:
             self._approach_warned = 2
             logfire.warn(
                 "Approach light: RED ({pct:.0%})",
@@ -987,7 +987,7 @@ class AlphaClient:
                 "before you can finish them."
             )
 
-        if pct >= 0.60 and self._approach_warned < 1:
+        if pct >= 0.65 and self._approach_warned < 1:
             self._approach_warned = 1
             logfire.info(
                 "Approach light: AMBER ({pct:.0%})",
@@ -1099,10 +1099,10 @@ class AlphaClient:
                                 "data": new_base64,
                             },
                         })
-                        # Add path hint so Alpha can use it with cortex store
+                        # Sense memory nudge — remind Alpha to notice what she sees
                         processed.append({
                             "type": "text",
-                            "text": f"[Image saved: {thumb_path}]",
+                            "text": f"📷 {thumb_path} — Remember this?",
                         })
                         images_processed += 1
                         continue

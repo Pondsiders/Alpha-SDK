@@ -554,7 +554,7 @@ def create_fetch_server():
                     content = [image_block]
                     meta = f"Image from {original_url} ({content_type}, {len(body):,} bytes)"
                     if thumb_path:
-                        meta += f"\n[Image saved: {thumb_path}]"
+                        meta += f"\n📷 {thumb_path} — Remember this?"
                         span.set_attribute("thumbnail_path", thumb_path)
                     content.append({"type": "text", "text": meta})
                     return {"content": content}
