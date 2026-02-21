@@ -42,6 +42,10 @@ import logfire
 
 from claude_agent_sdk import tool, create_sdk_mcp_server
 
+from ..memories.vision import caption_image
+from ..memories.embeddings import embed_query, EmbeddingError
+from ..memories.db import search_memories
+
 
 # Cloudflare Browser Rendering config (optional)
 _CF_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
@@ -343,6 +347,79 @@ async def _process_image(image_bytes: bytes, content_type: str) -> tuple[dict[st
         }, None
 
 
+async def _image_recall(base64_data: str) -> str | None:
+    """Image-triggered memory recall for fetched images.
+
+    Same pipeline as client.py's _image_recall:
+    caption → embed → search → text-only breadcrumbs.
+
+    Graceful degradation: returns None on any failure.
+    """
+    with logfire.span("image_recall.fetch") as span:
+        try:
+            caption = await caption_image(base64_data)
+            if not caption:
+                span.set_attribute("stage", "caption_failed")
+                return None
+            span.set_attribute("caption", caption[:100])
+
+            caption_embedding = await embed_query(caption)
+
+            results = await search_memories(
+                query_embedding=caption_embedding,
+                query_text=caption,
+                limit=3,
+                min_score=0.5,
+            )
+
+            if not results:
+                span.set_attribute("stage", "no_matches")
+                return None
+
+            span.set_attribute("matches", len(results))
+
+            # Format as text-only breadcrumbs (same as client.py)
+            import pendulum
+            lines = ["🔍 This image reminds me of:"]
+            for item in results:
+                mem_id = item.get("id", "?")
+                metadata = item.get("metadata", {})
+                content = item.get("content", "").strip()
+                first_line = content.split("\n")[0]
+                if len(first_line) > 120:
+                    first_line = first_line[:117] + "..."
+                image_flag = " [📷 attached]" if metadata.get("image_path") else ""
+
+                # Relative time
+                relative = metadata.get("created_at", "")
+                try:
+                    dt = pendulum.parse(relative).in_tz("America/Los_Angeles")
+                    now = pendulum.now("America/Los_Angeles")
+                    diff = now.diff(dt)
+                    if diff.in_days() == 0:
+                        relative = "today"
+                    elif diff.in_days() == 1:
+                        relative = "yesterday"
+                    elif diff.in_days() < 7:
+                        relative = f"{diff.in_days()} days ago"
+                    elif diff.in_days() < 30:
+                        weeks = diff.in_days() // 7
+                        relative = f"{weeks} week{'s' if weeks > 1 else ''} ago"
+                except Exception:
+                    pass
+
+                lines.append(f"• Memory #{mem_id} ({relative}): {first_line}{image_flag}")
+
+            return "\n".join(lines)
+
+        except EmbeddingError:
+            logfire.warning("Image recall (fetch): embedding failed")
+            return None
+        except Exception as e:
+            logfire.warning(f"Image recall (fetch) failed: {e}")
+            return None
+
+
 # Content types that indicate RSS/Atom feeds
 _FEED_CONTENT_TYPES = {
     "application/rss+xml",
@@ -557,6 +634,13 @@ def create_fetch_server():
                         meta += f"\n📷 {thumb_path} — Remember this?"
                         span.set_attribute("thumbnail_path", thumb_path)
                     content.append({"type": "text", "text": meta})
+
+                    # Image-triggered recall: caption → embed → search → breadcrumb
+                    if thumb_path and image_block.get("data"):
+                        recall_text = await _image_recall(image_block["data"])
+                        if recall_text:
+                            content.append({"type": "text", "text": recall_text})
+
                     return {"content": content}
 
                 # Check for RSS/Atom feeds before HTML (some feeds use text/xml)

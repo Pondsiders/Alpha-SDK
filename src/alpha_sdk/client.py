@@ -43,9 +43,12 @@ from claude_agent_sdk.types import (
 
 from .archive import archive_turn
 from .compact_proxy import CompactProxy, TokenCountCallback
+from .memories.db import search_memories
+from .memories.embeddings import embed_query, EmbeddingError
 from .memories.images import load_thumbnail_base64, process_inline_image
 from .memories.recall import recall
 from .memories.suggest import suggest
+from .memories.vision import caption_image
 from .sessions import list_sessions, get_session_path, get_sessions_dir, SessionInfo
 from .system_prompt import assemble
 from .tools.cortex import create_cortex_server
@@ -80,41 +83,66 @@ def _message_to_dict(message: Any) -> dict:
         return {"type": type(message).__name__, "repr": repr(message)[:500]}
 
 
-def _format_memory(memory: dict) -> str:
-    """Format a memory for inclusion in user content.
-
-    Creates human-readable memory text with relative timestamps.
-    """
-    import pendulum
-
-    mem_id = memory.get("id", "?")
-    created_at = memory.get("created_at", "")
-    content = memory.get("content", "").strip()
-    score = memory.get("score")
-
-    # Simple relative time formatting
-    relative_time = created_at  # fallback
+def _relative_time(created_at: str) -> str:
+    """Format a created_at timestamp as human-readable relative time."""
     try:
         dt = pendulum.parse(created_at).in_tz("America/Los_Angeles")
         now = pendulum.now("America/Los_Angeles")
         diff = now.diff(dt)
         if diff.in_days() == 0:
-            relative_time = f"today at {dt.format('h:mm A')}"
+            return f"today at {dt.format('h:mm A')}"
         elif diff.in_days() == 1:
-            relative_time = f"yesterday at {dt.format('h:mm A')}"
+            return f"yesterday at {dt.format('h:mm A')}"
         elif diff.in_days() < 7:
-            relative_time = f"{diff.in_days()} days ago"
+            return f"{diff.in_days()} days ago"
         elif diff.in_days() < 30:
             weeks = diff.in_days() // 7
-            relative_time = f"{weeks} week{'s' if weeks > 1 else ''} ago"
+            return f"{weeks} week{'s' if weeks > 1 else ''} ago"
         else:
-            relative_time = dt.format("ddd MMM D YYYY")
+            return dt.format("ddd MMM D YYYY")
     except Exception:
-        pass
+        return created_at  # fallback to raw string
+
+
+def _format_memory(memory: dict) -> str:
+    """Format a memory for inclusion in user content.
+
+    Creates human-readable memory text with relative timestamps.
+    """
+    mem_id = memory.get("id", "?")
+    content = memory.get("content", "").strip()
+    score = memory.get("score")
+    relative = _relative_time(memory.get("created_at", ""))
 
     # Include score if present (helps with debugging/transparency)
     score_str = f", score {score:.2f}" if score is not None else ""
-    return f"## Memory #{mem_id} ({relative_time}{score_str})\n{content}"
+    return f"## Memory #{mem_id} ({relative}{score_str})\n{content}"
+
+
+def _format_image_recall(results: list[dict[str, Any]]) -> str:
+    """Format memories for image-triggered recall.
+
+    Text-only breadcrumbs — no binary image injection.
+    This prevents recursion: images reminding of images that have images.
+    """
+    lines = ["🔍 This image reminds me of:"]
+    for item in results:
+        mem_id = item.get("id", "?")
+        metadata = item.get("metadata", {})
+        relative = _relative_time(metadata.get("created_at", ""))
+        content = item.get("content", "").strip()
+
+        # First line only, truncated for breadcrumb
+        first_line = content.split("\n")[0]
+        if len(first_line) > 120:
+            first_line = first_line[:117] + "..."
+
+        # Flag memories that have attached images
+        image_flag = " [📷 attached]" if metadata.get("image_path") else ""
+
+        lines.append(f"• Memory #{mem_id} ({relative}): {first_line}{image_flag}")
+
+    return "\n".join(lines)
 
 
 class AlphaClient:
@@ -431,8 +459,8 @@ class AlphaClient:
             if isinstance(prompt, str):
                 content_blocks.append({"type": "text", "text": prompt})
             else:
-                # Process content blocks — resize inline images for safety & token efficiency
-                processed_prompt = self._process_inline_images(prompt)
+                # Process content blocks — resize inline images, trigger image recall
+                processed_prompt = await self._process_inline_images(prompt)
                 content_blocks.extend(processed_prompt)
 
             # Approach lights: context warnings at 60% and 70%
@@ -1064,14 +1092,17 @@ class AlphaClient:
     # Image Processing
     # -------------------------------------------------------------------------
 
-    def _process_inline_images(self, content_blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    async def _process_inline_images(self, content_blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Process inline images in content blocks.
 
         For each image block:
         1. Resize to 768px long edge JPEG (safety valve + token efficiency)
         2. Save thumbnail to Alpha-Home/images/thumbnails/
         3. Replace original base64 with thumbnail base64
-        4. Add a text block with the thumbnail path (so Alpha can attach it to memories)
+        4. Add a text block with the thumbnail path (sense memory nudge)
+        5. Caption the image via Gemma 3 12B vision
+        6. Search Cortex for related memories
+        7. If matches found, inject text-only breadcrumbs (no image injection)
 
         This prevents Request Too Large errors from retina screenshots
         and makes every pasted image available for `cortex store --image`.
@@ -1105,6 +1136,15 @@ class AlphaClient:
                             "text": f"📷 {thumb_path} — Remember this?",
                         })
                         images_processed += 1
+
+                        # Image-triggered recall: caption → embed → search → breadcrumb
+                        recall_text = await self._image_recall(new_base64)
+                        if recall_text:
+                            processed.append({
+                                "type": "text",
+                                "text": recall_text,
+                            })
+
                         continue
                     # Fall through to original if processing fails
 
@@ -1114,6 +1154,55 @@ class AlphaClient:
             logfire.info(f"Processed {images_processed} inline image(s)")
 
         return processed
+
+    async def _image_recall(self, base64_data: str) -> str | None:
+        """Image-triggered memory recall.
+
+        Pipeline: caption image → embed caption → search Cortex → format breadcrumbs.
+        Returns formatted text block or None if no matches / pipeline fails.
+
+        Graceful degradation: any failure returns None silently.
+        The image still works normally — just the nudge, no recall.
+        """
+        with logfire.span("image_recall") as span:
+            try:
+                # Step 1: Caption the image via Gemma 3 12B vision
+                caption = await caption_image(base64_data)
+                if not caption:
+                    span.set_attribute("stage", "caption_failed")
+                    return None
+                span.set_attribute("caption", caption[:100])
+
+                # Step 2: Embed the caption text
+                caption_embedding = await embed_query(caption)
+
+                # Step 3: Search Cortex with the caption embedding
+                # Uses the full three-way scoring (exact + full-text + semantic)
+                # Higher threshold than regular recall — we want strong matches only
+                results = await search_memories(
+                    query_embedding=caption_embedding,
+                    query_text=caption,
+                    limit=3,
+                    min_score=0.5,
+                )
+
+                if not results:
+                    span.set_attribute("stage", "no_matches")
+                    logfire.debug("Image recall: no matches above threshold")
+                    return None
+
+                span.set_attribute("matches", len(results))
+                span.set_attribute("match_ids", [r["id"] for r in results])
+
+                # Step 4: Format as text-only breadcrumbs (no image injection)
+                return _format_image_recall(results)
+
+            except EmbeddingError:
+                logfire.warning("Image recall: embedding failed")
+                return None
+            except Exception as e:
+                logfire.warning(f"Image recall failed: {e}")
+                return None
 
     # -------------------------------------------------------------------------
     # Internal
