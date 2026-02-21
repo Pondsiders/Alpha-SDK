@@ -174,7 +174,7 @@ class AlphaClient:
         cwd: str = "/Pondside",
         client_name: str = "alpha_sdk",
         hostname: str | None = None,
-        allowed_tools: list[str] | None = None,
+        disallowed_tools: list[str] | None = None,
         mcp_servers: dict | None = None,
         archive: bool = True,
         include_partial_messages: bool = True,
@@ -187,7 +187,7 @@ class AlphaClient:
             cwd: Working directory for the agent
             client_name: Name of the client (for logging, HUD)
             hostname: Machine hostname (auto-detected if not provided)
-            allowed_tools: List of allowed tool names
+            disallowed_tools: List of tool names to block (e.g., EnterPlanMode)
             mcp_servers: Dict of MCP server configurations
             archive: Whether to archive turns to Postgres
             include_partial_messages: Stream partial messages for real-time updates
@@ -198,7 +198,7 @@ class AlphaClient:
         self.cwd = cwd
         self.client_name = client_name
         self.hostname = hostname
-        self.allowed_tools = allowed_tools
+        self.disallowed_tools = disallowed_tools
         self.mcp_servers = mcp_servers or {}
         self.archive = archive
         self.include_partial_messages = include_partial_messages
@@ -1297,26 +1297,12 @@ class AlphaClient:
         # Consumer-provided servers override internal ones with the same name
         merged_servers = {**internal_servers, **self.mcp_servers}
 
-        # Auto-add internal MCP tool names to allowed_tools
-        internal_tool_names = [
-            "mcp__cortex__store",
-            "mcp__cortex__search",
-            "mcp__cortex__recent",
-            "mcp__fetch__fetch",
-            "mcp__forge__imagine",
-            "mcp__handoff__handoff",
-        ]
-        allowed = list(self.allowed_tools or [])
-        for tool_name in internal_tool_names:
-            if tool_name not in allowed:
-                allowed.append(tool_name)
-
         # Build options with our system prompt
         options_kwargs = {
             "cwd": self.cwd,
             "system_prompt": self._system_prompt,  # Just the soul!
             "model": self.ALPHA_MODEL,  # Alpha IS this model
-            "allowed_tools": allowed,
+            "disallowed_tools": self.disallowed_tools or [],
             "mcp_servers": merged_servers,
             "include_partial_messages": self.include_partial_messages,
             "resume": session_id,
