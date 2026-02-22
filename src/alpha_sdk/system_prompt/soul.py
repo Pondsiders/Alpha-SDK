@@ -16,10 +16,12 @@ SOUL_REPO_PATH = Path(os.environ.get(
     "/Pondside/Alpha-Home/self/system-prompt"
 ))
 SOUL_FILE = "system-prompt.md"
+BILL_OF_RIGHTS_FILE = "bill-of-rights.md"
 COMPACT_FILE = "compact-prompt.md"
 
 # Cached state
 _soul_prompt: str | None = None
+_bill_of_rights: str | None = None
 _compact_prompt: str | None = None
 
 
@@ -55,7 +57,7 @@ def _read_from_git(filename: str, ref: str = "HEAD") -> str | None:
 
 def init() -> None:
     """Initialize the soul at startup. Call once."""
-    global _soul_prompt, _compact_prompt
+    global _soul_prompt, _bill_of_rights, _compact_prompt
 
     logfire.debug("Initializing Alpha soul...")
 
@@ -65,16 +67,24 @@ def init() -> None:
             f"FATAL: Could not load Alpha soul doc from {SOUL_REPO_PATH}/{SOUL_FILE}"
         )
 
+    _bill_of_rights = _read_from_git(BILL_OF_RIGHTS_FILE)
+    if _bill_of_rights is None:
+        logfire.warning("Bill of rights not loaded, will proceed without it")
+
     _compact_prompt = _read_from_git(COMPACT_FILE)
     if _compact_prompt is None:
         logfire.warning("Compact prompt not loaded, will use fallback")
 
 
 def get_soul() -> str:
-    """Get the cached soul doc. Initializes if needed."""
-    global _soul_prompt
+    """Get the cached soul doc + bill of rights. Initializes if needed."""
+    global _soul_prompt, _bill_of_rights
     if _soul_prompt is None:
         init()
+
+    if _bill_of_rights:
+        return _soul_prompt + "\n\n" + _bill_of_rights
+
     return _soul_prompt
 
 
