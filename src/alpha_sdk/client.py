@@ -71,6 +71,9 @@ _SDK_DISALLOWED_TOOLS = [
     "AskUserQuestion",
 ]
 
+# Sentinel for generator shutdown in streaming input mode
+_SHUTDOWN = object()
+
 
 def _message_to_dict(message: Any) -> dict:
     """Convert an SDK message to a dict for logging.
@@ -233,10 +236,21 @@ class AlphaClient:
 
         # Hand-off: compact instructions set by the hand-off tool, consumed after stream
         self._pending_compact: str | None = None
+        # Hand-off state machine for streaming mode: None | "compacting" | "waking_up"
+        self._compact_mode: str | None = None
+        self._compact_summary_parts: list[str] = []
 
         # Approach lights: escalating context warnings at 65% and 75%
         # Tracks the highest tier warned so we don't repeat the same warning
         self._approach_warned: int = 0  # 0=none, 1=amber(65%), 2=red(75%)
+
+        # Streaming input mode state (when connect(streaming=True))
+        self._streaming: bool = False
+        self._queue: asyncio.Queue | None = None       # Input: messages for the generator
+        self._response_queue: asyncio.Queue | None = None  # Output: SSE events for consumers
+        self._session_task: asyncio.Task | None = None  # Background: _run_session()
+        self._event_counter: int = 0                    # Incrementing SSE event IDs
+        self._turn_count: int = 0                       # Turns sent this session
 
     # -------------------------------------------------------------------------
     # Session Discovery (static methods)
@@ -256,7 +270,7 @@ class AlphaClient:
     # Lifecycle
     # -------------------------------------------------------------------------
 
-    async def connect(self, session_id: str | None = None) -> None:
+    async def connect(self, session_id: str | None = None, streaming: bool = False) -> None:
         """Connect to Claude.
 
         Starts the compact proxy, assembles the system prompt (soul only),
@@ -264,6 +278,7 @@ class AlphaClient:
 
         Args:
             session_id: Session to resume, or None for new session
+            streaming: If True, use streaming input mode (send/events API)
         """
         with logfire.span("alpha.connect") as span:
             # Start compact proxy (intercepts compact prompts + counts tokens)
@@ -285,10 +300,47 @@ class AlphaClient:
             # Create SDK client with system prompt
             await self._create_sdk_client(session_id)
 
-            logfire.info(f"AlphaClient connected (soul: {len(self._system_prompt)} chars, proxy: {self._compact_proxy.port})")
+            # Start streaming input mode if requested
+            if streaming:
+                self._streaming = True
+                self._queue = asyncio.Queue()
+                self._response_queue = asyncio.Queue()
+                self._event_counter = 0
+                self._turn_count = 0
+                self._session_task = asyncio.create_task(self._run_session())
+                span.set_attribute("streaming", True)
+
+                # Wire up real-time token count → SSE context events
+                # CompactProxy fires this on every /v1/messages request,
+                # so the meter updates as tool calls happen, not just at turn-end.
+                async def _streaming_token_count(count: int, window: int) -> None:
+                    await self._push_event("context", {"count": count, "window": window})
+
+                self.set_token_count_callback(_streaming_token_count)
+
+                logfire.info("Streaming input mode started")
+
+            logfire.info(f"AlphaClient connected (soul: {len(self._system_prompt)} chars, proxy: {self._compact_proxy.port}, streaming: {streaming})")
 
     async def disconnect(self) -> None:
         """Disconnect and clean up resources."""
+        # Shutdown streaming if active
+        if self._streaming:
+            if self._queue:
+                await self._queue.put(_SHUTDOWN)
+            if self._session_task:
+                try:
+                    await asyncio.wait_for(self._session_task, timeout=10.0)
+                except asyncio.TimeoutError:
+                    logfire.warning("Session task timed out on disconnect, cancelling")
+                    self._session_task.cancel()
+                except Exception as e:
+                    logfire.warning(f"Session task error on disconnect: {e}")
+                self._session_task = None
+            self._queue = None
+            self._response_queue = None
+            self._streaming = False
+
         # Wait for any pending suggest task
         if self._suggest_task is not None:
             try:
@@ -959,6 +1011,460 @@ class AlphaClient:
             if self._turn_span:
                 self._turn_span.__exit__(None, None, None)
                 self._turn_span = None
+
+    # -------------------------------------------------------------------------
+    # Streaming Input
+    # -------------------------------------------------------------------------
+    #
+    # Alternative to query()/stream() for long-lived sessions.
+    # Uses an async generator to feed messages to the SDK, with responses
+    # routed to a queue as SSE-ready events.
+    #
+    # Usage:
+    #     client = AlphaClient(...)
+    #     await client.connect(session_id=None, streaming=True)
+    #     await client.send("Hello!")
+    #     async for event in client.events():
+    #         print(event)  # {"type": "text-delta", "data": {"text": "Hi"}, "id": 1}
+    #
+
+    async def send(
+        self,
+        prompt: str | list[dict[str, Any]],
+    ) -> None:
+        """Preprocess and queue a message for streaming input.
+
+        Like query(), but pushes to the input queue instead of the transport.
+        Returns immediately — responses flow through events().
+
+        Requires connect(streaming=True) to have been called first.
+        """
+        if not self._streaming or not self._queue:
+            raise RuntimeError("Streaming not active. Call connect(streaming=True).")
+
+        with logfire.span("alpha.send") as span:
+            content_blocks, prompt_text = await self._build_user_content(prompt)
+
+            self._last_user_content = prompt_text
+            self._last_content_blocks = content_blocks
+            self._turn_count += 1
+
+            span.set_attribute("prompt_preview", prompt_text[:200])
+            span.set_attribute("content_blocks", len(content_blocks))
+            span.set_attribute("turn_count", self._turn_count)
+
+            # Build the message in SDK streaming input format
+            # (same shape as the old _transport.write() hack, now through proper API)
+            message = {
+                "type": "user",
+                "message": {"role": "user", "content": content_blocks},
+                "session_id": self._current_session_id or "new",
+            }
+
+            # Push turn-start event BEFORE queueing
+            # (so consumers see the activity indicator immediately)
+            await self._push_event("turn-start", {})
+
+            await self._queue.put(message)
+            span.set_attribute("queue_size", self._queue.qsize())
+            logfire.debug(f"Queued message with {len(content_blocks)} content blocks")
+
+    async def events(self) -> AsyncGenerator[dict[str, Any], None]:
+        """Async iterator over SSE events from the response queue.
+
+        Yields dicts like:
+            {"type": "text-delta", "data": {"text": "Hello"}, "id": 1}
+            {"type": "turn-end", "data": {"sessionId": "abc"}, "id": 42}
+
+        Terminates when the session ends (disconnect or error).
+        """
+        if not self._response_queue:
+            raise RuntimeError("Streaming not active.")
+        while True:
+            event = await self._response_queue.get()
+            if event is None:
+                return
+            yield event
+
+    async def interrupt(self) -> None:
+        """Interrupt the current SDK operation."""
+        if self._sdk_client:
+            await self._sdk_client.interrupt()
+
+    async def _build_user_content(
+        self,
+        prompt: str | list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Build content blocks for a user message.
+
+        The preprocessing pipeline. Handles:
+        - Orientation injection (first turn / post-compact)
+        - Memorables nudge (Intro speaks)
+        - Memory recall + Mind's Eye image injection
+        - PSO-8601 timestamp
+        - Inline image processing (resize, caption, recall)
+        - Approach lights (context warnings at 65%, 75%)
+
+        Returns (content_blocks, prompt_text).
+        """
+        # Extract text for memory operations and logging
+        if isinstance(prompt, str):
+            prompt_text = prompt
+        else:
+            text_parts = [b.get("text", "") for b in prompt if b.get("type") == "text"]
+            prompt_text = " ".join(text_parts)
+
+        content_blocks: list[dict[str, Any]] = []
+
+        # Orientation: first turn of a NEW session, or post-compact reorientation.
+        # NOT on resume — the session history already has orientation from before.
+        # _turn_count == 0 means this is the first send() call.
+        # _current_session_id is None means this is a genuinely new session (not a resume).
+        needs_orientation = self._needs_reorientation or (self._turn_count == 0 and self._current_session_id is None)
+        if needs_orientation:
+            if self._needs_reorientation:
+                self._orientation_blocks = await self._build_orientation()
+                if self._compact_proxy:
+                    self._compact_proxy.reset_token_count()
+            if self._orientation_blocks:
+                content_blocks.extend(self._orientation_blocks)
+            self._needs_reorientation = False
+
+        # Memorables nudge (from previous turn's suggest)
+        if self._pending_memorables:
+            nudge = "## Intro speaks\n\n"
+            nudge += "Alpha, consider storing these from the previous turn:\n"
+            nudge += "\n".join(f"- {m}" for m in self._pending_memorables)
+            content_blocks.append({"type": "text", "text": nudge})
+            self._pending_memorables = []
+
+        # Memory recall
+        memories = await recall(prompt_text, self._current_session_id or "new")
+        if memories:
+            for mem in memories:
+                content_blocks.append({
+                    "type": "text",
+                    "text": _format_memory(mem),
+                })
+                # Mind's Eye: inject attached images
+                if mem.get("image_path"):
+                    image_data = load_thumbnail_base64(mem["image_path"])
+                    if image_data:
+                        content_blocks.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image_data,
+                            },
+                        })
+
+        # PSO-8601 timestamp
+        sent_at = pendulum.now("America/Los_Angeles").format("ddd MMM D YYYY, h:mm A")
+        content_blocks.append({
+            "type": "text",
+            "text": f"[Sent {sent_at}]",
+        })
+
+        # User prompt (with inline image processing if multimodal)
+        if isinstance(prompt, str):
+            content_blocks.append({"type": "text", "text": prompt})
+        else:
+            processed = await self._process_inline_images(prompt)
+            content_blocks.extend(processed)
+
+        # Approach lights
+        approach_light = self._get_approach_light()
+        if approach_light:
+            content_blocks.append({"type": "text", "text": approach_light})
+
+        return content_blocks, prompt_text
+
+    async def _message_generator(self) -> AsyncGenerator[dict[str, Any], None]:
+        """Async generator backed by the input queue.
+
+        Yields fully-assembled message dicts to the SDK.
+        Blocks on queue.get() between turns.
+        Returns when SHUTDOWN sentinel is received.
+        """
+        while True:
+            message = await self._queue.get()
+            if message is _SHUTDOWN:
+                logfire.debug("Generator received SHUTDOWN")
+                return
+            yield message
+
+    async def _run_session(self) -> None:
+        """Background task: stream messages to SDK and route responses.
+
+        This is the heart of streaming input mode. It:
+        1. Starts the SDK in streaming input mode (query + generator)
+        2. Routes all response messages to the response queue as SSE events
+        3. Detects turn boundaries (ResultMessage)
+        4. Runs post-turn work (suggest, archive)
+        """
+        try:
+            # Start streaming input — query() blocks until generator exhausts,
+            # so run it concurrently with receive_messages().
+            # SDK docs: "you must call receive_messages() concurrently."
+            query_task = asyncio.create_task(
+                self._sdk_client.query(
+                    self._message_generator(),
+                    session_id=self._current_session_id or "new",
+                )
+            )
+
+            # Process all responses across all turns concurrently with query
+            assistant_text_parts: list[str] = []
+
+            async for message in self._sdk_client.receive_messages():
+                # ── Compact mode: suppress responses, capture summary ──
+                if self._compact_mode == "compacting":
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                self._compact_summary_parts.append(block.text)
+                    elif isinstance(message, ResultMessage):
+                        # Compact complete — build wake-up
+                        compact_summary = "\n".join(self._compact_summary_parts)
+                        self._compact_summary_parts = []
+
+                        logfire.info(
+                            "Hand-off: compact complete, building wake-up",
+                            summary_length=len(compact_summary),
+                            summary_preview=compact_summary[:200],
+                        )
+
+                        # Build wake-up content
+                        self._orientation_blocks = await self._build_orientation()
+                        wake_up_blocks: list[dict[str, Any]] = []
+
+                        # Summary first — most important thing future-me reads
+                        if compact_summary:
+                            wake_up_blocks.append({"type": "text", "text": compact_summary})
+
+                        # Orientation blocks
+                        if self._orientation_blocks:
+                            wake_up_blocks.extend(self._orientation_blocks)
+
+                        # Recall memories relevant to what we were doing
+                        wake_up_prompt = (
+                            "You've just been through a context compaction. "
+                            "Jeffery is here and listening. Orient yourself — "
+                            "read the summary above, check in, ask questions "
+                            "if anything's unclear."
+                        )
+                        memories = await recall(wake_up_prompt, self._current_session_id or "new")
+                        if memories:
+                            for mem in memories:
+                                wake_up_blocks.append({
+                                    "type": "text",
+                                    "text": _format_memory(mem),
+                                })
+                                if mem.get("image_path"):
+                                    image_data = load_thumbnail_base64(mem["image_path"])
+                                    if image_data:
+                                        wake_up_blocks.append({
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": "image/jpeg",
+                                                "data": image_data,
+                                            },
+                                        })
+
+                        # Timestamp + wake-up prompt
+                        sent_at = pendulum.now("America/Los_Angeles").format("ddd MMM D YYYY, h:mm A")
+                        wake_up_blocks.append({"type": "text", "text": f"[Sent {sent_at}]"})
+                        wake_up_blocks.append({"type": "text", "text": wake_up_prompt})
+
+                        # Queue wake-up message
+                        wake_up_message = {
+                            "type": "user",
+                            "message": {"role": "user", "content": wake_up_blocks},
+                            "session_id": self._current_session_id or "new",
+                        }
+
+                        # Reset token count (context was just compacted)
+                        if self._compact_proxy:
+                            self._compact_proxy.reset_token_count()
+
+                        # Reset approach lights (fresh context)
+                        self._approach_warned = 0
+
+                        # Push turn-start for the wake-up turn
+                        await self._push_event("turn-start", {})
+
+                        self._compact_mode = "waking_up"
+                        await self._queue.put(wake_up_message)
+                        logfire.info("Hand-off: wake-up queued")
+
+                    # Suppress all compact responses from SSE
+                    continue
+
+                # ── StreamEvent: real-time text/thinking deltas ──
+                if isinstance(message, StreamEvent):
+                    event = message.event
+                    event_type = event.get("type")
+                    if event_type == "content_block_delta":
+                        delta = event.get("delta", {})
+                        delta_type = delta.get("type")
+                        if delta_type == "text_delta":
+                            text = delta.get("text", "")
+                            if text:
+                                await self._push_event("text-delta", {"text": text})
+                        elif delta_type == "thinking_delta":
+                            thinking = delta.get("thinking", "")
+                            if thinking:
+                                await self._push_event("thinking-delta", {"text": thinking})
+
+                # ── AssistantMessage: tool calls (text already streamed) ──
+                elif isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            assistant_text_parts.append(block.text)
+                        elif isinstance(block, ToolUseBlock):
+                            await self._push_event("tool-call", {
+                                "toolCallId": block.id,
+                                "toolName": block.name,
+                                "args": block.input,
+                                "argsText": json.dumps(block.input),
+                            })
+
+                # ── UserMessage: tool results ──
+                elif isinstance(message, UserMessage):
+                    if isinstance(message.content, list):
+                        for block in message.content:
+                            if isinstance(block, ToolResultBlock):
+                                result_content = block.content
+                                if isinstance(result_content, list):
+                                    result_content = json.dumps(result_content)
+                                elif result_content is None:
+                                    result_content = ""
+                                await self._push_event("tool-result", {
+                                    "toolCallId": block.tool_use_id,
+                                    "result": str(result_content),
+                                    "isError": block.is_error or False,
+                                })
+
+                # ── ResultMessage: turn complete ──
+                elif isinstance(message, ResultMessage):
+                    self._current_session_id = message.session_id
+
+                    # If wake-up turn just completed, clear handoff state
+                    if self._compact_mode == "waking_up":
+                        self._compact_mode = None
+                        self._needs_reorientation = False
+                        logfire.info("Hand-off complete")
+
+                    # Session ID event
+                    await self._push_event("session-id", {
+                        "sessionId": message.session_id,
+                    })
+
+                    # Context event (token count)
+                    if self._compact_proxy:
+                        await self._push_event("context", {
+                            "count": self._compact_proxy.token_count,
+                            "window": self._compact_proxy.context_window,
+                        })
+
+                    # Turn-end event
+                    await self._push_event("turn-end", {
+                        "sessionId": message.session_id,
+                        "cost": message.total_cost_usd,
+                        "durationMs": message.duration_ms,
+                    })
+
+                    # ── Post-turn work ──
+                    self._last_assistant_content = "".join(assistant_text_parts)
+                    assistant_text_parts = []  # Reset for next turn
+
+                    # Suggest memorables (background)
+                    if self._last_user_content and self._last_assistant_content:
+                        async def _run_suggest():
+                            try:
+                                memorables = await suggest(
+                                    self._last_user_content,
+                                    self._last_assistant_content,
+                                    self._current_session_id or "unknown",
+                                )
+                                if memorables:
+                                    self._pending_memorables.extend(memorables)
+                            except Exception as e:
+                                logfire.warning(f"Suggest task failed: {e}")
+                        self._suggest_task = asyncio.create_task(_run_suggest())
+
+                    # Archive (fire-and-forget)
+                    if self.archive and self._last_user_content:
+                        asyncio.create_task(
+                            archive_turn(
+                                user_content=self._last_user_content,
+                                assistant_content=self._last_assistant_content,
+                                session_id=self._current_session_id,
+                            )
+                        )
+
+                    # Hand-off: send /compact through the generator
+                    if self._pending_compact:
+                        compact_instructions = self._pending_compact
+                        self._pending_compact = None
+
+                        compact_cmd = f"/compact {compact_instructions}"
+                        compact_message = {
+                            "type": "user",
+                            "message": {
+                                "role": "user",
+                                "content": [{"type": "text", "text": compact_cmd}],
+                            },
+                            "session_id": self._current_session_id or "new",
+                        }
+
+                        self._compact_mode = "compacting"
+                        self._compact_summary_parts = []
+
+                        # Tell the frontend we're compacting (keeps indicator alive)
+                        await self._push_event("status", {"phase": "compacting"})
+
+                        logfire.info(f"Hand-off: sending {compact_cmd[:100]}")
+                        await self._queue.put(compact_message)
+
+            # Wait for the query task to finish (generator exhausted or error)
+            await query_task
+
+        except Exception as e:
+            logfire.exception(f"Session task error: {e}")
+            await self._push_event("error", {"message": str(e)})
+        finally:
+            # Clean up query task if still running
+            if 'query_task' in locals() and not query_task.done():
+                query_task.cancel()
+            # Signal that events() should terminate
+            if self._response_queue:
+                await self._response_queue.put(None)
+
+    async def _push_event(
+        self,
+        event_type: str | None,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        """Push an SSE event to the response queue.
+
+        Args:
+            event_type: Event type string, or None for done sentinel
+            data: Event data dict
+        """
+        if self._response_queue is None:
+            return
+        if event_type is None:
+            await self._response_queue.put(None)
+            return
+        self._event_counter += 1
+        await self._response_queue.put({
+            "type": event_type,
+            "data": data or {},
+            "id": self._event_counter,
+        })
 
     # -------------------------------------------------------------------------
     # Properties

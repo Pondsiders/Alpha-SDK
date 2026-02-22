@@ -769,9 +769,10 @@ class CompactProxy:
 
         # Token counting: fire-and-forget for /v1/messages requests
         # (Skip count_tokens endpoint itself to avoid recursion)
+        # Always count — the callback is for real-time notification,
+        # but the count itself is needed for context-o-meter polling.
         if body is not None and path == "/v1/messages":
-            if self._on_token_count:
-                asyncio.create_task(self._count_tokens_and_update(body, headers))
+            asyncio.create_task(self._count_tokens_and_update(body, headers))
 
         # Forward to Anthropic
         url = f"{ANTHROPIC_API_URL}{path}"
