@@ -63,6 +63,14 @@ _ALPHA_PLUGIN_DIR = str(Path(__file__).parent.parent.parent.parent / "alpha_plug
 # Store original ANTHROPIC_BASE_URL so we can restore it
 _ORIGINAL_ANTHROPIC_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL")
 
+# Tools that are Claude Code concepts and break non-CC clients.
+# These are always disallowed, regardless of what the consumer passes.
+_SDK_DISALLOWED_TOOLS = [
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "AskUserQuestion",
+]
+
 
 def _message_to_dict(message: Any) -> dict:
     """Convert an SDK message to a dict for logging.
@@ -1302,7 +1310,7 @@ class AlphaClient:
             "cwd": self.cwd,
             "system_prompt": self._system_prompt,  # Just the soul!
             "model": self.ALPHA_MODEL,  # Alpha IS this model
-            "disallowed_tools": self.disallowed_tools or [],
+            "disallowed_tools": _SDK_DISALLOWED_TOOLS + (self.disallowed_tools or []),
             "mcp_servers": merged_servers,
             "include_partial_messages": self.include_partial_messages,
             "resume": session_id,
