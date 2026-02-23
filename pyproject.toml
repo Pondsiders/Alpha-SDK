@@ -1,6 +1,6 @@
 [project]
 name = "alpha_sdk"
-version = "0.5.2"
+version = "0.5.3"
 description = "Everything that turns Claude into Alpha"
 requires-python = ">=3.11"
 dependencies = [

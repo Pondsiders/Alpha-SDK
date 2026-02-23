@@ -1,0 +1,54 @@
+name: Publish Package
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout source (tagged commit)
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build wheel
+        run: uv build --wheel --no-sources
+
+      - name: Publish to package index
+        run: |
+          # Configure git for the push to gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Save the wheel before switching branches
+          WHEEL=$(ls dist/*.whl)
+          WHEEL_NAME=$(basename "$WHEEL")
+          cp "$WHEEL" /tmp/"$WHEEL_NAME"
+
+          # Switch to gh-pages
+          git fetch origin gh-pages
+          git checkout gh-pages
+
+          # Copy wheel into index
+          mkdir -p simple/alpha-sdk
+          cp /tmp/"$WHEEL_NAME" simple/alpha-sdk/
+
+          # Regenerate index.html from all wheels present
+          cd simple/alpha-sdk
+          echo '<!DOCTYPE html><html><body>' > index.html
+          for whl in *.whl; do
+            echo "<a href=\"$whl\">$whl</a>" >> index.html
+          done
+          echo '</body></html>' >> index.html
+          cd ../..
+
+          # Commit and push
+          git add simple/
+          git commit -m "Publish $WHEEL_NAME"
+          git push origin gh-pages
