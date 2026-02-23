@@ -188,44 +188,43 @@ async def _search_extracted_queries(
         return memories
 
 
-async def recall(prompt: str, session_id: str) -> list[dict[str, Any]]:
+async def recall_from(
+    text: str,
+    exclude: list[int] | None = None,
+) -> list[dict[str, Any]]:
     """
-    Associative recall: what sounds familiar from this prompt?
+    Associative recall without session lifecycle.
 
-    Uses two parallel strategies:
-    1. Direct embedding search (fast, semantic similarity)
-    2. OLMo query extraction + search (slower, catches distinctive terms)
-
-    Results are merged and deduped. Filters via in-process seen-cache.
+    Runs the dual-strategy search (direct embedding + OLMo query extraction)
+    against the given text. Returns matching memories, deduped within the batch.
 
     Args:
-        prompt: The user's message
-        session_id: Current session ID (for seen-cache scoping)
+        text: Arbitrary text to recall against (email body, document, etc.)
+        exclude: Optional list of memory IDs to exclude from results
 
     Returns:
         List of memory dicts with keys: id, content, created_at, score
     """
-    with logfire.span("recall", session_id=session_id[:8] if session_id else "none") as span:
-        seen = get_seen_ids(session_id)
-        seen_list = list(seen)
-        logfire.debug("Seen IDs loaded", count=len(seen_list))
+    with logfire.span("recall_from") as span:
+        exclude_list = list(exclude) if exclude else []
+        logfire.debug("Excluded IDs", count=len(exclude_list))
 
         # Run direct search and query extraction in parallel
         direct_task = cortex_search(
-            query=prompt,
+            query=text,
             limit=DIRECT_LIMIT,
-            exclude=seen_list if seen_list else None,
+            exclude=exclude_list if exclude_list else None,
             min_score=MIN_SCORE,
         )
-        extract_task = _extract_queries(prompt)
+        extract_task = _extract_queries(text)
 
         direct_memories, extracted_queries = await asyncio.gather(direct_task, extract_task)
 
         span.set_attribute("extracted_queries", extracted_queries)
         span.set_attribute("direct_memory_ids", [m["id"] for m in direct_memories])
 
-        # Build exclude list for extracted searches
-        exclude_for_extracted = set(seen_list)
+        # Build exclude list for extracted searches (dedupe against direct results)
+        exclude_for_extracted = set(exclude_list)
         for mem in direct_memories:
             exclude_for_extracted.add(mem["id"])
 
@@ -245,10 +244,6 @@ async def recall(prompt: str, session_id: str) -> list[dict[str, Any]]:
             logfire.info("No memories above threshold")
             return []
 
-        # Mark as seen (in-process, no Redis)
-        new_ids = [m["id"] for m in all_memories]
-        mark_seen(session_id, new_ids)
-
         logfire.debug(
             "Recall complete",
             extracted=len(extracted_memories),
@@ -257,3 +252,30 @@ async def recall(prompt: str, session_id: str) -> list[dict[str, Any]]:
         )
 
         return all_memories
+
+
+async def recall(prompt: str, session_id: str) -> list[dict[str, Any]]:
+    """
+    Associative recall: what sounds familiar from this prompt?
+
+    Session-aware wrapper around recall_from(). Filters via in-process seen-cache
+    so memories aren't repeated within a session.
+
+    Args:
+        prompt: The user's message
+        session_id: Current session ID (for seen-cache scoping)
+
+    Returns:
+        List of memory dicts with keys: id, content, created_at, score
+    """
+    with logfire.span("recall", session_id=session_id[:8] if session_id else "none"):
+        seen = get_seen_ids(session_id)
+        seen_list = list(seen)
+        logfire.debug("Seen IDs loaded", count=len(seen_list))
+
+        memories = await recall_from(prompt, exclude=seen_list if seen_list else None)
+
+        if memories:
+            mark_seen(session_id, [m["id"] for m in memories])
+
+        return memories
