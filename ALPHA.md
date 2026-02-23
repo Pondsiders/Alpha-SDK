@@ -40,16 +40,43 @@ Why have each client implement this separately? Why have services on alpha-pi wh
 
 - **Postgres** — memories, archival, capsule summaries
 - **Redis** — caching (weather, calendar, todos, memorables buffer)
-- **Pulse** — still schedules Routines
-- **Gemma 3 12B on Primer** — recall query extraction and memorables suggestion
+- **Pulse** — schedules Routines and capsule jobs
+- **Gemma 3 12B on Primer** — recall query extraction and memorables suggestion (via Ollama)
 
 ## Deployment Model
 
 **Duckpond** installs the SDK as an editable local package (`pip install -e`). It picks up changes immediately — no restart needed for Python changes, restart Duckpond for structural changes. This is the live tinkering environment.
 
-**Routines, Solitude, and other consumers** pin to `alpha_sdk @ git+https://github.com/Pondsiders/Alpha-SDK@main`. They only see code that has been merged to `main` and pushed to GitHub. This is deliberate safety: tinkering on the SDK during the day cannot break Solitude's nighttime breathing.
+**Routines, Solitude, and other consumers** install from the **Pondsiders package index** at `pondsiders.github.io/Alpha-SDK/simple/`. They pin to semver ranges (e.g. `>=0.5,<1.0`) and only see published releases. This is deliberate safety: tinkering on the SDK during the day cannot break Solitude's nighttime breathing.
 
-**The workflow:** tinker on the `tinkering` branch → test live via Duckpond → when happy, merge to `main` and push → other consumers get the changes on next install/restart.
+Consumer `pyproject.toml` configuration:
+```toml
+[project]
+dependencies = ["alpha_sdk>=0.5,<1.0"]
+
+[[tool.uv.index]]
+url = "https://pondsiders.github.io/Alpha-SDK/simple/"
+name = "pondsiders"
+explicit = true
+
+[tool.uv.sources]
+alpha_sdk = { index = "pondsiders" }
+```
+
+The `explicit = true` + `[tool.uv.sources]` prevents dependency confusion — uv only checks our index for alpha_sdk, PyPI for everything else.
+
+**The release workflow:**
+1. Tinker on the `tinkering` branch
+2. Test live via Duckpond (editable install)
+3. When happy, merge to `main`
+4. Bump version: `uv version --bump patch` (or `minor`/`major`)
+5. Commit, tag, push: `git tag v0.5.3 && git push origin main --tags`
+6. GitHub Action builds wheel and publishes to gh-pages branch (~60 seconds)
+7. Consumers update: `uv lock --upgrade-package alpha_sdk && uv sync`
+
+**Versioning:** Semver. Patch for bugfixes, minor for new features, major for breaking changes. The `query()`→`send()` consolidation will be v1.0.0.
+
+**Infrastructure:** The package index is a PEP 503 simple repository hosted on GitHub Pages from the `gh-pages` orphan branch. The publish Action (`.github/workflows/publish.yml`) triggers on `v*` tags, runs `uv build --wheel --no-sources`, and commits the wheel to gh-pages.
 
 ## Architecture
 
@@ -76,6 +103,7 @@ src/alpha_sdk/
 │   ├── cortex.py            # store, search, recent (high-level API)
 │   ├── embeddings.py        # Embedding generation via Ollama
 │   ├── images.py            # Mind's Eye (image storage + thumbnailing)
+│   ├── vision.py            # Image description via Claude vision
 │   ├── recall.py            # Smart recall (embedding + Gemma query extraction)
 │   └── suggest.py           # Intro — Gemma memorables extraction
 └── tools/
@@ -89,35 +117,27 @@ src/alpha_sdk/
 
 AlphaClient is a **long-lived** wrapper around the Claude Agent SDK. The SDK has a ~4 second startup cost, so we keep one client alive and reuse it across conversations.
 
-### Basic Usage
+### Two Modes (consolidating to one)
+
+**Streaming input mode** (`send()`/`events()`) — persistent SSE. Used by Duckpond. Fire-and-forget sends, responses flow through a long-lived event stream. This is the future — all consumers will use this pattern.
+
+**One-shot mode** (`query()`/`stream()`) — request/response. Used by Routines. Send prompt, collect response, done. Will be replaced by `send_and_collect()` convenience wrapper in v1.0.0.
 
 ```python
-from alpha_sdk import AlphaClient
-
-# Create once at application startup
-client = AlphaClient(
-    cwd="/Pondside",
-    allowed_tools=[...],
-    mcp_servers={...},
-)
-await client.connect()
-
-# Use for multiple conversations
-await client.query(prompt, session_id="abc123")  # Resume existing
-async for event in client.stream():
+# Streaming input mode (Duckpond pattern, the future)
+client = AlphaClient(cwd="/Pondside", client_name="duckpond")
+await client.connect(session_id, streaming=True)
+await client.send(content)
+async for event in client.events():
+    if event.get("type") == "turn-end":
+        break
     yield event
 
-await client.query(other_prompt, session_id="xyz789")  # Different session
-async for event in client.stream():
-    yield event
-
-await client.query(new_prompt)  # New session (no session_id)
-async for event in client.stream():
-    yield event
-print(client.session_id)  # Capture the new session ID
-
-# Cleanup when done
-await client.disconnect()
+# One-shot mode (Routines pattern, being deprecated)
+async with AlphaClient(cwd="/Pondside") as client:
+    await client.query(prompt, session_id=session_id)
+    async for event in client.stream():
+        yield event
 ```
 
 ### Session Discovery
@@ -140,15 +160,6 @@ path = AlphaClient.get_session_path("30bb8d6f...", cwd="/Pondside")
 
 Consumers don't need to know about JSONL files or path formatting.
 
-### Context Manager (for one-shot use)
-
-```python
-async with AlphaClient(cwd="/Pondside") as client:
-    await client.query(prompt, session_id=session_id)
-    async for event in client.stream():
-        yield event
-```
-
 ## How It Works
 
 ### Long-Lived Client & Session Switching
@@ -157,12 +168,10 @@ The SDK client is expensive to create (~4 seconds). AlphaClient handles this by:
 
 1. Creating the SDK client once at `connect()`
 2. Tracking the current session ID
-3. When `query(session_id=X)` is called:
-   - If X matches current session → reuse client
-   - If X differs → recreate SDK client with new `resume` option
-   - If X is None → recreate for new session, capture resulting ID
+3. On session change (different session_id): close and recreate the client
+4. On same session: reuse existing client
 
-This means Duckpond can be a dumb pass-through: whatever session_id the frontend sends, AlphaClient figures out whether to reuse or recreate.
+In streaming mode, `send()` queues messages and `events()` yields responses. In one-shot mode, `query()` blocks until the response is ready and `stream()` yields it. Both modes handle session switching transparently.
 
 ### The Proxy Pattern
 
@@ -196,92 +205,60 @@ All cache-friendly. Nothing invalidates per-turn.
 
 **Before the turn:**
 - `recall()` runs with the user's prompt
-- Parallel: embedding search + OLMo query extraction
+- Parallel: embedding search + Gemma query extraction
 - Deduplicated against session's seen-cache in Redis
 - Injected as content blocks (not system prompt)
 
 **After the turn:**
 - `suggest()` runs (fire-and-forget)
-- OLMo extracts memorable moments
+- Gemma extracts memorable moments
 - Results buffer in Redis for potential storage
 
 **On `cortex store`:**
 - Memory saved to Postgres with embedding
 - Redis buffer cleared
 
-## What Duckpond Becomes
+## Consumers
+
+### Duckpond (streaming input mode)
+
+Duckpond uses `send()`/`events()` — the persistent SSE pattern. One long-lived client, fire-and-forget message sending, responses flow through a persistent event stream.
 
 ```python
-# routes/chat.py - dramatically simplified
+# Simplified from duckpond/client.py
+client = AlphaClient(cwd="/Pondside", client_name="duckpond")
+await client.connect(session_id, streaming=True)
 
-@app.post("/api/chat")
-async def chat(request: ChatRequest):
-    async def generate():
-        async with AlphaClient(
-            session_id=request.session_id,
-            allowed_tools=ALLOWED_TOOLS,
-            mcp_servers={"cortex": cortex_server},
-        ) as client:
-            await client.query(request.content)
-
-            async for event in client.stream():
-                yield f"data: {event.json()}\n\n"
-
-            yield f"data: {json.dumps({'type': 'session-id', 'id': client.session_id})}\n\n"
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
+await client.send(content)              # Fire and forget
+async for event in client.events():     # Persistent SSE pipe
+    yield event
 ```
 
-## What Routines Becomes
+### Routines (one-shot mode)
+
+Routines uses `query()`/`stream()` — send a prompt, collect the full response. Planned migration to `send()`/`events()` with a `send_and_collect()` convenience wrapper (v1.0.0).
 
 ```python
-# harness.py - also dramatically simplified
-
-async def run_routine(routine: Routine) -> str:
-    ctx = RoutineContext(now=pendulum.now("America/Los_Angeles"))
-    prompt = routine.build_prompt(ctx)
-
-    async with AlphaClient(
-        session_id=routine.get_session_id(),
-        fork_from=routine.fork_from_key,
-        allowed_tools=routine.get_allowed_tools(),
-    ) as client:
-        await client.query(prompt)
-
-        output = []
-        async for event in client.stream():
-            if hasattr(event, 'text'):
-                output.append(event.text)
-
-        return routine.handle_output("".join(output), ctx)
+# Simplified from routines/harness.py
+async with AlphaClient(cwd="/Pondside") as client:
+    await client.query(prompt, session_id=session_id)
+    async for event in client.stream():
+        if hasattr(event, 'text'):
+            output.append(event.text)
 ```
 
-## Migration Path
+### Capsule summaries (not yet using alpha_sdk)
 
-1. **Create `alpha_sdk` package** in Basement
-2. **Port memory code** from Duckpond's `memories/`
-3. **Port system prompt assembly** from Loom's `AlphaPattern`
-4. **Build the proxy** (`proxy.py`)
-5. **Build the client wrapper** (`client.py`)
-6. **Update Duckpond** to use `alpha_sdk`
-7. **Update Routines** to use `alpha_sdk`
-8. **Decommission** Deliverator, Loom, Argonath
+Yesterday/last-night summaries are Pulse jobs (`Basement/Pulse/src/pulse/jobs/capsule.py`) that spawn `scripts/capsule.py` via subprocess with raw Agent SDK. No soul, no memory recall, no orientation. Should eventually be converted to Routines.
 
-Steps 1-5 can happen without touching Duckpond. Steps 6-7 are the switchover. Step 8 is cleanup.
+## History
 
-## What Dies
+All completed. Kept for context when old memories reference these:
 
-- **Deliverator** — no more header promotion needed
-- **The Loom as a service** — becomes library code
-- **Argonath as a service** — becomes library code
-- **The hooks** — no longer needed, we control everything upstream
-- **The metadata envelope** — no in-band signaling needed
-- **Claude Code as a UI** — we use Duckpond exclusively now
-
-## Open Questions
-
-- **Cortex as library vs service?** Currently HTTP. Could become a library too (just Postgres operations). Decided: separate package, dependency of `alpha_sdk`.
-- **OLMo location?** Currently on Primer. Stays there for now (GPU).
+- **Migration from proxy chain** — Deliverator, Loom, Argonath all absorbed into the SDK. Containers stopped February 7, 2026.
+- **Cortex absorption** — was an HTTP service, now direct Postgres in `memories/`.
+- **Hooks removal** — `.claude/` hooks replaced by SDK internals.
+- **Identity-agnostic refactor** — February 2026, stripped all Alpha-specific personality to create a clean shell. Rosemary's SDK forked from this.
 
 ## Session Storage
 
@@ -307,4 +284,4 @@ AlphaClient's `list_sessions()` and `get_session_path()` encapsulate all of this
 
 ## Status
 
-**In production.** Duckpond, Routines, and Solitude all run on alpha_sdk. The tinkering never stops, but the foundation is solid.
+**In production.** Duckpond and Routines (including Solitude) run on alpha_sdk. The tinkering never stops, but the foundation is solid.
