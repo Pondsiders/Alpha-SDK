@@ -386,6 +386,29 @@ class AlphaClient:
             self._last_user_content = prompt_text
             span.set_attribute("prompt_preview", prompt_text[:200])
 
+            # ── Slash command fast path ──
+            # Skip orientation/recall/timestamp/approach-lights for commands
+            # that start with '/'. These are SDK-native commands that don't
+            # need the full preprocessing pipeline.
+            if isinstance(prompt, str) and prompt.startswith("/"):
+                if prompt.startswith("/handoff"):
+                    # Extract instructions and trigger the existing handoff flow.
+                    # Same destination as the MCP hand-off tool — new front door.
+                    instructions = prompt[len("/handoff"):].strip()
+                    self.request_compact(instructions or "No specific instructions.")
+
+                # Send the raw command without preprocessing
+                raw_blocks = [{"type": "text", "text": prompt}]
+                self._last_content_blocks = raw_blocks
+                message = {
+                    "type": "user",
+                    "message": {"role": "user", "content": raw_blocks},
+                    "session_id": self._current_session_id or "new",
+                }
+                await self._sdk_client._transport.write(json.dumps(message) + "\n")
+                logfire.debug(f"Slash command sent: {prompt[:100]}")
+                return
+
             # Build content blocks
             content_blocks: list[dict[str, Any]] = []
 
