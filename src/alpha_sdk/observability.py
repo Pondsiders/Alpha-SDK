@@ -1,30 +1,15 @@
-"""Observability setup - Logfire configuration.
+"""Observability setup - placeholder.
 
-Centralizes logging and tracing configuration so all
-alpha_sdk consumers get consistent observability.
-
-We use logfire.info/warn/error/debug directly instead of
-Python's logging module. This ensures all logs are properly
-associated with the current span context.
+Previously configured Logfire for tracing and logging.
+Now a no-op retained for import compatibility.
 """
-
-import logfire
 
 
 def configure(service_name: str = "alpha_sdk", debug: bool = False) -> None:
-    """Configure Logfire for observability.
+    """Configure observability (no-op).
 
     Args:
         service_name: Name to identify this service in traces.
         debug: If True, also log to console. Default False (quiet mode).
     """
-    logfire.configure(
-        service_name=service_name,
-        distributed_tracing=True,
-        scrubbing=False,  # Too aggressive, redacts normal words
-        send_to_logfire="if-token-present",
-        console=debug,  # Only show console output in debug mode
-    )
-
-    # Instrument httpx for trace propagation
-    logfire.instrument_httpx()
+    pass

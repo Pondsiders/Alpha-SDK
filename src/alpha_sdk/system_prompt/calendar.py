@@ -5,7 +5,6 @@ What's coming up.
 
 import os
 
-import logfire
 import redis.asyncio as aioredis
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://alpha-pi:6379")
@@ -31,6 +30,5 @@ async def get_events() -> str | None:
         finally:
             await r.aclose()
 
-    except Exception as e:
-        logfire.warning(f"Error fetching calendar: {e}")
+    except Exception:
         return None

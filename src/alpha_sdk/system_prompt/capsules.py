@@ -3,7 +3,6 @@
 The past section: what happened yesterday and last night.
 """
 
-import logfire
 import pendulum
 
 from ..memories.db import get_pool
@@ -53,6 +52,5 @@ async def get_capsules() -> tuple[str | None, str | None]:
         else:
             return None, None
 
-    except Exception as e:
-        logfire.warning(f"Error fetching capsules: {e}")
+    except Exception:
         return None, None

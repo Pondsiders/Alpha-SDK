@@ -36,7 +36,6 @@ if TYPE_CHECKING:
     from .client import AlphaClient
 
 import httpx
-import logfire
 from aiohttp import web
 
 # Token counting callback type: (token_count, context_window) -> None or Awaitable[None]
@@ -159,7 +158,6 @@ def rewrite_compact(body: dict) -> dict:
     system = body.get("system", [])
     phase1_triggered = _has_summarizer_system(system)
     if phase1_triggered:
-        logfire.info("Compact detected: replacing summarizer system prompt")
         body["system"] = _replace_system_prompt(system)
 
     # Phase 2: Replace compact instructions in last user message
@@ -167,19 +165,6 @@ def rewrite_compact(body: dict) -> dict:
 
     # Phase 3: Replace post-compact continuation instruction
     phase3_triggered = _replace_continuation_instruction(body)
-
-    # If ANY phase triggered, log the full body for debugging
-    if phase1_triggered or phase2_triggered or phase3_triggered:
-        with logfire.span(
-            "compact.rewrite",
-            phase1_system=phase1_triggered,
-            phase2_instructions=phase2_triggered,
-            phase3_continuation=phase3_triggered,
-        ) as span:
-            # Log full body (might be huge, but we need it for debugging)
-            span.set_attribute("body_json", json.dumps(body, indent=2)[:50000])  # Cap at 50KB
-            span.set_attribute("message_count", len(body.get("messages", [])))
-            span.set_attribute("system_type", type(body.get("system")).__name__)
 
     return body
 
@@ -272,9 +257,7 @@ def _replace_compact_instructions(body: dict) -> bool:
                 prompt = _get_compact_prompt()
                 if additional:
                     prompt += f"\n\n---\n\nAdditional instructions from the user:\n{additional}"
-                    logfire.info(f"Compact: preserved additional instructions: {additional[:100]}")
                 message["content"] = original + "\n\n" + prompt
-                logfire.info("Compact: replaced instructions in string content")
                 return True
             return False
 
@@ -291,9 +274,7 @@ def _replace_compact_instructions(body: dict) -> bool:
                     prompt = _get_compact_prompt()
                     if additional:
                         prompt += f"\n\n---\n\nAdditional instructions from the user:\n{additional}"
-                        logfire.info(f"Compact: preserved additional instructions: {additional[:100]}")
                     block["text"] = original + "\n\n" + prompt
-                    logfire.info("Compact: replaced instructions in content block")
                     return True
             return False
 
@@ -330,7 +311,6 @@ def _replace_continuation_instruction(body: dict) -> bool:
             new_content, replaced = replace_in_text(content)
             if replaced:
                 message["content"] = new_content
-                logfire.info("Compact: replaced continuation instruction")
                 any_replaced = True
 
         elif isinstance(content, list):
@@ -341,7 +321,6 @@ def _replace_continuation_instruction(body: dict) -> bool:
                 new_text, replaced = replace_in_text(text)
                 if replaced:
                     block["text"] = new_text
-                    logfire.info("Compact: replaced continuation instruction in block")
                     any_replaced = True
 
     return any_replaced
@@ -419,7 +398,6 @@ class CompactProxy:
         self._site = web.TCPSite(self._runner, "127.0.0.1", self._port)
         await self._site.start()
 
-        logfire.info(f"Compact proxy listening on http://127.0.0.1:{self._port}")
         return self._port
 
     async def stop(self) -> None:
@@ -434,7 +412,6 @@ class CompactProxy:
 
         self._site = None
         self._app = None
-        logfire.debug("Compact proxy stopped")
 
     @property
     def base_url(self) -> str:
@@ -470,9 +447,7 @@ class CompactProxy:
 
     def reset_token_count(self) -> None:
         """Reset token count to 0. Call this after compaction."""
-        old_count = self._token_count
         self._token_count = 0
-        logfire.info(f"Token count reset: {old_count} -> 0")
 
     async def _count_tokens_and_update(self, body: dict, headers: dict) -> None:
         """Count tokens in the request and update if it's a new max.
@@ -490,89 +465,69 @@ class CompactProxy:
         # Check for API key - use ALPHA_ANTHROPIC_API_KEY to avoid SDK interference
         api_key = os.environ.get("ALPHA_ANTHROPIC_API_KEY")
         if not api_key:
-            if not self._warned_no_api_key:
-                logfire.warning(
-                    "Token counting disabled: ALPHA_ANTHROPIC_API_KEY not set. "
-                    "Set this environment variable to enable context-o-meter."
-                )
-                self._warned_no_api_key = True
+            self._warned_no_api_key = True
             return
 
         try:
-            with logfire.span("token_count.request") as span:
-                # Build auth headers - we need the API key for the count endpoint
-                count_headers = {
-                    "x-api-key": api_key,
-                    "anthropic-version": headers.get("anthropic-version", "2023-06-01"),
-                    "content-type": "application/json",
-                }
+            # Build auth headers - we need the API key for the count endpoint
+            count_headers = {
+                "x-api-key": api_key,
+                "anthropic-version": headers.get("anthropic-version", "2023-06-01"),
+                "content-type": "application/json",
+            }
 
-                # Build count_tokens body - only specific fields are accepted
-                # The endpoint rejects extra fields like metadata, max_tokens, stream, etc.
-                count_body = {}
-                for key in ("messages", "model", "system", "tools", "tool_choice", "thinking"):
-                    if key in body:
-                        count_body[key] = body[key]
+            # Build count_tokens body - only specific fields are accepted
+            # The endpoint rejects extra fields like metadata, max_tokens, stream, etc.
+            count_body = {}
+            for key in ("messages", "model", "system", "tools", "tool_choice", "thinking"):
+                if key in body:
+                    count_body[key] = body[key]
 
-                # Strip cache_control from tool definitions - the count_tokens endpoint
-                # is stricter than /v1/messages and rejects extra fields in tool schemas
-                if "tools" in count_body:
-                    cleaned_tools = []
-                    for tool in count_body["tools"]:
-                        tool = dict(tool)  # shallow copy
-                        tool.pop("cache_control", None)
-                        # Also clean cache_control from nested custom schema if present
-                        if "custom" in tool and isinstance(tool["custom"], dict):
-                            tool["custom"] = {
-                                k: v for k, v in tool["custom"].items()
-                                if k != "cache_control"
-                            }
-                        cleaned_tools.append(tool)
-                    count_body["tools"] = cleaned_tools
+            # Strip cache_control from tool definitions - the count_tokens endpoint
+            # is stricter than /v1/messages and rejects extra fields in tool schemas
+            if "tools" in count_body:
+                cleaned_tools = []
+                for tool in count_body["tools"]:
+                    tool = dict(tool)  # shallow copy
+                    tool.pop("cache_control", None)
+                    # Also clean cache_control from nested custom schema if present
+                    if "custom" in tool and isinstance(tool["custom"], dict):
+                        tool["custom"] = {
+                            k: v for k, v in tool["custom"].items()
+                            if k != "cache_control"
+                        }
+                    cleaned_tools.append(tool)
+                count_body["tools"] = cleaned_tools
 
-                # Call the token counting endpoint
-                response = await self._http_client.post(
-                    f"{ANTHROPIC_API_URL}/v1/messages/count_tokens",
-                    content=json.dumps(count_body).encode(),
-                    headers=count_headers,
-                    timeout=10.0,  # Quick timeout, this is fire-and-forget
-                )
+            # Call the token counting endpoint
+            response = await self._http_client.post(
+                f"{ANTHROPIC_API_URL}/v1/messages/count_tokens",
+                content=json.dumps(count_body).encode(),
+                headers=count_headers,
+                timeout=10.0,  # Quick timeout, this is fire-and-forget
+            )
 
-                if response.status_code != 200:
+            if response.status_code != 200:
+                return
+
+            result = response.json()
+            new_count = result.get("input_tokens", 0)
+
+            # Only update if this is larger than what we've seen
+            if new_count > self._token_count:
+                self._token_count = new_count
+
+                # Fire the callback if we have one
+                if self._on_token_count:
                     try:
-                        error_body = response.json()
+                        result = self._on_token_count(self._token_count, self._context_window)
+                        if asyncio.iscoroutine(result):
+                            await result
                     except Exception:
-                        error_body = response.text
-                    logfire.debug(f"Token count failed: {response.status_code} - {error_body}")
-                    return
+                        pass
 
-                result = response.json()
-                new_count = result.get("input_tokens", 0)
-                span.set_attribute("input_tokens", new_count)
-
-                # Only update if this is larger than what we've seen
-                if new_count > self._token_count:
-                    old_count = self._token_count
-                    self._token_count = new_count
-
-                    logfire.info(
-                        f"Token count: {old_count} -> {new_count} "
-                        f"({new_count / self._context_window * 100:.1f}%)"
-                    )
-
-                    # Fire the callback if we have one
-                    if self._on_token_count:
-                        try:
-                            result = self._on_token_count(self._token_count, self._context_window)
-                            # If it returns an awaitable, await it
-                            if asyncio.iscoroutine(result):
-                                await result
-                        except Exception as e:
-                            logfire.warning(f"Token count callback error: {e}")
-
-        except Exception as e:
-            # Don't let token counting errors affect the main request
-            logfire.debug(f"Token count error (ignored): {e}")
+        except Exception:
+            pass
 
     def _capture_request(self, path: str, body: dict, suffix: str = "") -> None:
         """Dump request to a JSON file for debugging.
@@ -598,11 +553,10 @@ class CompactProxy:
             with open(filepath, "w") as f:
                 json.dump(body, f, indent=2, default=str)
 
-            logfire.debug(f"Captured request to {filepath}")
-        except Exception as e:
-            logfire.warning(f"Failed to capture request: {e}")
+        except Exception:
+            pass
 
-    def _sniff_usage_headers(self, headers: httpx.Headers, span: logfire.LogfireSpan) -> None:
+    def _sniff_usage_headers(self, headers: httpx.Headers) -> None:
         """Extract usage quota from Anthropic response headers.
 
         Headers are floats 0.0-1.0 representing budget utilization:
@@ -615,96 +569,18 @@ class CompactProxy:
         if util_7d is not None:
             try:
                 self._usage_7d = float(util_7d)
-                span.set_attribute("usage_7d", self._usage_7d)
             except ValueError:
                 pass
 
         if util_5h is not None:
             try:
                 self._usage_5h = float(util_5h)
-                span.set_attribute("usage_5h", self._usage_5h)
             except ValueError:
                 pass
 
-        if self._usage_7d is not None or self._usage_5h is not None:
-            logfire.debug(
-                "Usage: 7d={usage_7d_pct}%, 5h={usage_5h_pct}%",
-                usage_7d_pct=f"{self._usage_7d * 100:.1f}" if self._usage_7d is not None else "?",
-                usage_5h_pct=f"{self._usage_5h * 100:.1f}" if self._usage_5h is not None else "?",
-            )
-
-    def _log_error_response(
-        self,
-        path: str,
-        status_code: int,
-        response_headers: httpx.Headers,
-        response_body: bytes,
-        request_size: int,
-        span: logfire.LogfireSpan,
-    ) -> None:
-        """Log full details of an error response for debugging.
-
-        Captures: status code, all response headers, response body,
-        and the request size that triggered it. Everything goes to Logfire
-        so we can see exactly what Anthropic (or Cloudflare) told us.
-        """
-        # Decode response body (best-effort)
-        try:
-            body_text = response_body.decode("utf-8")
-        except UnicodeDecodeError:
-            body_text = f"<binary, {len(response_body)} bytes>"
-
-        # Try to parse as JSON for structured logging
-        try:
-            body_json = json.loads(body_text)
-        except (json.JSONDecodeError, ValueError):
-            body_json = None
-
-        # Collect ALL response headers
-        all_headers = {k: v for k, v in response_headers.items()}
-
-        # Determine likely source from headers
-        source = "unknown"
-        server = response_headers.get("server", "").lower()
-        if "cloudflare" in server:
-            source = "cloudflare"
-        elif "anthropic" in response_headers.get("x-request-id", ""):
-            source = "anthropic"
-        elif response_headers.get("x-request-id"):
-            source = "anthropic"  # Anthropic sets x-request-id
-
-        with logfire.span(
-            "api_error",
-            _level="error",
-            path=path,
-            status_code=status_code,
-            source=source,
-            request_size_bytes=request_size,
-            request_size_kb=round(request_size / 1024, 1),
-        ) as error_span:
-            error_span.set_attribute("response_headers", json.dumps(all_headers, indent=2))
-            error_span.set_attribute("response_body", body_text[:10000])  # Cap at 10KB
-            if body_json:
-                error_span.set_attribute("error_type", body_json.get("error", {}).get("type", "unknown"))
-                error_span.set_attribute("error_message", body_json.get("error", {}).get("message", "unknown"))
-
-        # Also log a human-readable summary
-        error_msg = ""
-        if body_json and "error" in body_json:
-            error_msg = f" — {body_json['error'].get('type', '?')}: {body_json['error'].get('message', '?')}"
-        logfire.error(
-            "API {status_code} from {source} on {path} (request was {size_kb:.1f} KB){error_msg}",
-            status_code=status_code,
-            source=source,
-            path=path,
-            size_kb=request_size / 1024,
-            error_msg=error_msg,
-        )
 
     async def _handle_request(self, request: web.Request) -> web.StreamResponse:
         """Handle incoming requests."""
-        from contextlib import nullcontext
-
         path = "/" + request.match_info.get("path", "")
 
         if request.method == "GET" and path == "/health":
@@ -713,27 +589,15 @@ class CompactProxy:
         if request.method != "POST":
             return web.Response(status=404, text="Not found")
 
-        # Attach trace context so spans nest under the current turn
-        context_manager = (
-            logfire.attach_context(self._trace_context)
-            if self._trace_context
-            else nullcontext()
-        )
-
-        with context_manager:
-            with logfire.span("compact_proxy.forward", path=path) as span:
-                try:
-                    return await self._forward_request(request, path, span)
-                except Exception as e:
-                    logfire.error(f"Compact proxy error: {e}")
-                    span.set_attribute("error", str(e))
-                    return web.Response(status=500, text=str(e))
+        try:
+            return await self._forward_request(request, path)
+        except Exception as e:
+            return web.Response(status=500, text=str(e))
 
     async def _forward_request(
         self,
         request: web.Request,
         path: str,
-        span: logfire.LogfireSpan,
     ) -> web.StreamResponse:
         """Forward request to Anthropic, rewriting compact prompts."""
         body_bytes = await request.read()
@@ -780,39 +644,18 @@ class CompactProxy:
         if self._http_client is None:
             raise RuntimeError("HTTP client not initialized")
 
-        # Log request size for diagnostics
-        request_size = len(body_bytes)
-        span.set_attribute("request_size_bytes", request_size)
-        logfire.debug(
-            "Forwarding {path}: {size_kb:.1f} KB",
-            path=path,
-            size_kb=request_size / 1024,
-        )
-
         async with self._http_client.stream(
             "POST",
             url,
             content=body_bytes,
             headers=headers,
         ) as response:
-            span.set_attribute("status_code", response.status_code)
-
             # Sniff usage quota headers from Anthropic's response
-            self._sniff_usage_headers(response.headers, span)
+            self._sniff_usage_headers(response.headers)
 
-            # On error responses: buffer the body and log everything
+            # On error responses: buffer and pass through
             if response.status_code >= 400:
                 error_body = await response.aread()
-                self._log_error_response(
-                    path=path,
-                    status_code=response.status_code,
-                    response_headers=response.headers,
-                    response_body=error_body,
-                    request_size=request_size,
-                    span=span,
-                )
-
-                # Still pass the error through to the SDK client
                 resp = web.Response(
                     status=response.status_code,
                     body=error_body,

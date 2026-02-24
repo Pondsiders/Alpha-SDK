@@ -7,7 +7,6 @@ Used for image-triggered memory recall — the caption becomes the search query.
 import os
 
 import httpx
-import logfire
 
 # Configuration from environment — same pattern as embeddings.py
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://alpha-pi:11434")
@@ -29,38 +28,30 @@ async def caption_image(base64_data: str, timeout: float = 15.0) -> str | None:
     Returns:
         Caption text, or None if captioning fails (graceful degradation)
     """
-    with logfire.span("vision.caption", model=VISION_MODEL) as span:
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(
-                    f"{OLLAMA_URL.rstrip('/')}/api/generate",
-                    json={
-                        "model": VISION_MODEL,
-                        "prompt": CAPTION_PROMPT,
-                        "images": [base64_data],
-                        "stream": False,
-                        "keep_alive": -1,  # Keep model loaded
-                    },
-                )
-                response.raise_for_status()
-                data = response.json()
-                caption = data.get("response", "").strip()
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                f"{OLLAMA_URL.rstrip('/')}/api/generate",
+                json={
+                    "model": VISION_MODEL,
+                    "prompt": CAPTION_PROMPT,
+                    "images": [base64_data],
+                    "stream": False,
+                    "keep_alive": -1,  # Keep model loaded
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+            caption = data.get("response", "").strip()
 
-                if not caption:
-                    span.set_attribute("result", "empty_caption")
-                    return None
+            if not caption:
+                return None
 
-                span.set_attribute("caption_length", len(caption))
-                span.set_attribute("caption_preview", caption[:100])
-                logfire.info("Vision caption", preview=caption[:60])
-                return caption
+            return caption
 
-        except httpx.TimeoutException:
-            logfire.warning(f"Vision caption timeout after {timeout}s")
-            return None
-        except httpx.ConnectError:
-            logfire.warning(f"Ollama unreachable at {OLLAMA_URL}")
-            return None
-        except Exception as e:
-            logfire.warning(f"Vision caption failed: {e}")
-            return None
+    except httpx.TimeoutException:
+        return None
+    except httpx.ConnectError:
+        return None
+    except Exception:
+        return None

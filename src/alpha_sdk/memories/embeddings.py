@@ -8,7 +8,6 @@ Uses nomic-embed-text with proper task prefixes:
 import os
 
 import httpx
-import logfire
 
 # Configuration from environment
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://alpha-pi:11434")
@@ -38,43 +37,29 @@ async def embed_query(query: str) -> list[float]:
 
 async def _embed(prompt: str, timeout: float = 5.0) -> list[float]:
     """Call Ollama API to generate embedding."""
-    with logfire.span(
-        "cortex.embed",
-        model=OLLAMA_EMBED_MODEL,
-        prompt_preview=prompt[:50],
-    ) as span:
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(
-                    f"{OLLAMA_URL.rstrip('/')}/api/embeddings",
-                    json={
-                        "model": OLLAMA_EMBED_MODEL,
-                        "prompt": prompt,
-                        "keep_alive": -1,  # Keep model loaded indefinitely
-                    },
-                )
-                response.raise_for_status()
-                data = response.json()
-                embedding = data["embedding"]
-                span.set_attribute("embedding_dim", len(embedding))
-                return embedding
-        except httpx.TimeoutException:
-            logfire.warning(f"Ollama timeout after {timeout}s")
-            raise EmbeddingError("Embedding service timed out")
-        except httpx.HTTPStatusError as e:
-            body = e.response.text[:500] if e.response else "no response body"
-            logfire.warning(
-                "Ollama HTTP error: {status_code} - {body}",
-                status_code=e.response.status_code,
-                body=body,
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                f"{OLLAMA_URL.rstrip('/')}/api/embeddings",
+                json={
+                    "model": OLLAMA_EMBED_MODEL,
+                    "prompt": prompt,
+                    "keep_alive": -1,  # Keep model loaded indefinitely
+                },
             )
-            raise EmbeddingError(f"Embedding service error {e.response.status_code}: {body}")
-        except httpx.ConnectError:
-            logfire.warning(f"Ollama unreachable at {OLLAMA_URL}")
-            raise EmbeddingError("Embedding service unreachable")
-        except Exception as e:
-            logfire.error(f"Ollama unexpected error: {e}")
-            raise EmbeddingError(f"Embedding failed: {e}")
+            response.raise_for_status()
+            data = response.json()
+            embedding = data["embedding"]
+            return embedding
+    except httpx.TimeoutException:
+        raise EmbeddingError("Embedding service timed out")
+    except httpx.HTTPStatusError as e:
+        body = e.response.text[:500] if e.response else "no response body"
+        raise EmbeddingError(f"Embedding service error {e.response.status_code}: {body}")
+    except httpx.ConnectError:
+        raise EmbeddingError("Embedding service unreachable")
+    except Exception as e:
+        raise EmbeddingError(f"Embedding failed: {e}")
 
 
 async def health_check() -> bool:

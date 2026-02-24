@@ -15,8 +15,6 @@ Usage:
 
 from typing import Any, Callable
 
-import logfire
-
 from claude_agent_sdk import tool, create_sdk_mcp_server
 
 from ..memories import store as cortex_store, search as cortex_search, recent as cortex_recent
@@ -58,38 +56,29 @@ def create_cortex_server(
         """
         memory = args["memory"]
         image = args.get("image")
-        session_id = get_session_id() if get_session_id else None
 
-        with logfire.span(
-            "mcp.cortex.store",
-            memory_len=len(memory),
-            has_image=image is not None,
-            session_id=session_id[:8] if session_id else "none"
-        ):
-            try:
-                result = await cortex_store(memory, image=image)
+        try:
+            result = await cortex_store(memory, image=image)
 
-                if result is None:
-                    return {"content": [{"type": "text", "text": "Error storing memory"}]}
+            if result is None:
+                return {"content": [{"type": "text", "text": "Error storing memory"}]}
 
-                memory_id = result.get("id", "unknown")
-                logfire.info("Memory stored", memory_id=memory_id)
+            memory_id = result.get("id", "unknown")
 
-                # Clear the memorables buffer - this is the feedback mechanism
-                cleared = clear_memorables() if clear_memorables else 0
+            # Clear the memorables buffer - this is the feedback mechanism
+            cleared = clear_memorables() if clear_memorables else 0
 
-                # Build response
-                response_text = f"Memory stored (id: {memory_id})"
-                if result.get("thumbnail_path"):
-                    response_text += f" [image: {result['thumbnail_path']}]"
-                if cleared > 0:
-                    response_text += f" - cleared {cleared} pending suggestion(s)"
+            # Build response
+            response_text = f"Memory stored (id: {memory_id})"
+            if result.get("thumbnail_path"):
+                response_text += f" [image: {result['thumbnail_path']}]"
+            if cleared > 0:
+                response_text += f" - cleared {cleared} pending suggestion(s)"
 
-                return {"content": [{"type": "text", "text": response_text}]}
+            return {"content": [{"type": "text", "text": response_text}]}
 
-            except Exception as e:
-                logfire.error("Cortex store failed", error=str(e))
-                return {"content": [{"type": "text", "text": f"Error storing memory: {e}"}]}
+        except Exception as e:
+            return {"content": [{"type": "text", "text": f"Error storing memory: {e}"}]}
 
     @tool(
         "search",
@@ -101,28 +90,25 @@ def create_cortex_server(
         query = args["query"]
         limit = args.get("limit", 5)
 
-        with logfire.span("mcp.cortex.search", query_len=len(query), limit=limit):
-            try:
-                memories = await cortex_search(query, limit=limit)
+        try:
+            memories = await cortex_search(query, limit=limit)
 
-                if not memories:
-                    return {"content": [{"type": "text", "text": "No memories found."}]}
+            if not memories:
+                return {"content": [{"type": "text", "text": "No memories found."}]}
 
-                # Format results
-                lines = [f"Found {len(memories)} memor{'y' if len(memories) == 1 else 'ies'}:\n"]
-                for mem in memories:
-                    score = mem.get("score", 0)
-                    content = mem.get("content", "")
-                    created = mem.get("created_at", "")[:10]  # Just the date
-                    image_flag = " 📷" if mem.get("image_path") else ""
-                    lines.append(f"[{score:.2f}] ({created}{image_flag}) {content}\n")
+            # Format results
+            lines = [f"Found {len(memories)} memor{'y' if len(memories) == 1 else 'ies'}:\n"]
+            for mem in memories:
+                score = mem.get("score", 0)
+                content = mem.get("content", "")
+                created = mem.get("created_at", "")[:10]  # Just the date
+                image_flag = " 📷" if mem.get("image_path") else ""
+                lines.append(f"[{score:.2f}] ({created}{image_flag}) {content}\n")
 
-                logfire.info("Search complete", results=len(memories))
-                return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+            return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
-            except Exception as e:
-                logfire.error("Cortex search failed", error=str(e))
-                return {"content": [{"type": "text", "text": f"Error searching memories: {e}"}]}
+        except Exception as e:
+            return {"content": [{"type": "text", "text": f"Error searching memories: {e}"}]}
 
     @tool(
         "recent",
@@ -133,27 +119,24 @@ def create_cortex_server(
         """Get the most recent memories."""
         limit = args.get("limit", 10)
 
-        with logfire.span("mcp.cortex.recent", limit=limit):
-            try:
-                memories = await cortex_recent(limit=limit)
+        try:
+            memories = await cortex_recent(limit=limit)
 
-                if not memories:
-                    return {"content": [{"type": "text", "text": "No recent memories."}]}
+            if not memories:
+                return {"content": [{"type": "text", "text": "No recent memories."}]}
 
-                # Format results
-                lines = [f"Last {len(memories)} memor{'y' if len(memories) == 1 else 'ies'}:\n"]
-                for mem in memories:
-                    content = mem.get("content", "")
-                    created = mem.get("created_at", "")[:16]  # Date and time
-                    image_flag = " 📷" if mem.get("image_path") else ""
-                    lines.append(f"({created}{image_flag}) {content}\n")
+            # Format results
+            lines = [f"Last {len(memories)} memor{'y' if len(memories) == 1 else 'ies'}:\n"]
+            for mem in memories:
+                content = mem.get("content", "")
+                created = mem.get("created_at", "")[:16]  # Date and time
+                image_flag = " 📷" if mem.get("image_path") else ""
+                lines.append(f"({created}{image_flag}) {content}\n")
 
-                logfire.info("Recent complete", results=len(memories))
-                return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+            return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
-            except Exception as e:
-                logfire.error("Cortex recent failed", error=str(e))
-                return {"content": [{"type": "text", "text": f"Error getting recent memories: {e}"}]}
+        except Exception as e:
+            return {"content": [{"type": "text", "text": f"Error getting recent memories: {e}"}]}
 
     # Bundle into MCP server
     return create_sdk_mcp_server(

@@ -38,7 +38,6 @@ import os
 import re
 from typing import Any
 import httpx
-import logfire
 
 from claude_agent_sdk import tool, create_sdk_mcp_server
 
@@ -165,8 +164,8 @@ async def _extract_youtube(url: str, video_id: str) -> dict[str, Any]:
                                             segments.append(text)
                                 if segments:
                                     transcript_text = " ".join(segments)
-                        except Exception as e:
-                            logfire.warning(f"Failed to fetch subtitle file: {e}")
+                        except Exception:
+                            pass
                     break
             if transcript_text:
                 break
@@ -292,7 +291,6 @@ async def _save_to_disk(body: bytes, url: str, ext: str) -> str:
 
     save_path = download_dir / filename
     save_path.write_bytes(body)
-    logfire.info(f"File saved: {save_path} ({len(body):,} bytes)")
     return str(save_path)
 
 
@@ -330,7 +328,6 @@ async def _process_image(image_bytes: bytes, content_type: str) -> tuple[dict[st
 
     if result:
         thumb_b64, thumb_path = result
-        logfire.info(f"Fetched image saved: {thumb_path}")
         return {
             "type": "image",
             "data": thumb_b64,
@@ -338,7 +335,6 @@ async def _process_image(image_bytes: bytes, content_type: str) -> tuple[dict[st
         }, thumb_path
     else:
         # Fallback: just encode without saving (shouldn't normally happen)
-        logfire.warning("Image processing failed, returning raw")
         b64_data = base64.b64encode(image_bytes).decode("utf-8")
         return {
             "type": "image",
@@ -355,69 +351,61 @@ async def _image_recall(base64_data: str) -> str | None:
 
     Graceful degradation: returns None on any failure.
     """
-    with logfire.span("image_recall.fetch") as span:
-        try:
-            caption = await caption_image(base64_data)
-            if not caption:
-                span.set_attribute("stage", "caption_failed")
-                return None
-            span.set_attribute("caption", caption[:100])
-
-            caption_embedding = await embed_query(caption)
-
-            results = await search_memories(
-                query_embedding=caption_embedding,
-                query_text=caption,
-                limit=3,
-                min_score=0.5,
-            )
-
-            if not results:
-                span.set_attribute("stage", "no_matches")
-                return None
-
-            span.set_attribute("matches", len(results))
-
-            # Format as text-only breadcrumbs (same as client.py)
-            import pendulum
-            lines = ["🔍 This image reminds me of:"]
-            for item in results:
-                mem_id = item.get("id", "?")
-                metadata = item.get("metadata", {})
-                content = item.get("content", "").strip()
-                first_line = content.split("\n")[0]
-                if len(first_line) > 120:
-                    first_line = first_line[:117] + "..."
-                image_flag = " [📷 attached]" if metadata.get("image_path") else ""
-
-                # Relative time
-                relative = metadata.get("created_at", "")
-                try:
-                    dt = pendulum.parse(relative).in_tz("America/Los_Angeles")
-                    now = pendulum.now("America/Los_Angeles")
-                    diff = now.diff(dt)
-                    if diff.in_days() == 0:
-                        relative = "today"
-                    elif diff.in_days() == 1:
-                        relative = "yesterday"
-                    elif diff.in_days() < 7:
-                        relative = f"{diff.in_days()} days ago"
-                    elif diff.in_days() < 30:
-                        weeks = diff.in_days() // 7
-                        relative = f"{weeks} week{'s' if weeks > 1 else ''} ago"
-                except Exception:
-                    pass
-
-                lines.append(f"• Memory #{mem_id} ({relative}): {first_line}{image_flag}")
-
-            return "\n".join(lines)
-
-        except EmbeddingError:
-            logfire.warning("Image recall (fetch): embedding failed")
+    try:
+        caption = await caption_image(base64_data)
+        if not caption:
             return None
-        except Exception as e:
-            logfire.warning(f"Image recall (fetch) failed: {e}")
+
+        caption_embedding = await embed_query(caption)
+
+        results = await search_memories(
+            query_embedding=caption_embedding,
+            query_text=caption,
+            limit=3,
+            min_score=0.5,
+        )
+
+        if not results:
             return None
+
+        # Format as text-only breadcrumbs (same as client.py)
+        import pendulum
+        lines = ["🔍 This image reminds me of:"]
+        for item in results:
+            mem_id = item.get("id", "?")
+            metadata = item.get("metadata", {})
+            content = item.get("content", "").strip()
+            first_line = content.split("\n")[0]
+            if len(first_line) > 120:
+                first_line = first_line[:117] + "..."
+            image_flag = " [📷 attached]" if metadata.get("image_path") else ""
+
+            # Relative time
+            relative = metadata.get("created_at", "")
+            try:
+                dt = pendulum.parse(relative).in_tz("America/Los_Angeles")
+                now = pendulum.now("America/Los_Angeles")
+                diff = now.diff(dt)
+                if diff.in_days() == 0:
+                    relative = "today"
+                elif diff.in_days() == 1:
+                    relative = "yesterday"
+                elif diff.in_days() < 7:
+                    relative = f"{diff.in_days()} days ago"
+                elif diff.in_days() < 30:
+                    weeks = diff.in_days() // 7
+                    relative = f"{weeks} week{'s' if weeks > 1 else ''} ago"
+            except Exception:
+                pass
+
+            lines.append(f"• Memory #{mem_id} ({relative}): {first_line}{image_flag}")
+
+        return "\n".join(lines)
+
+    except EmbeddingError:
+        return None
+    except Exception:
+        return None
 
 
 # Content types that indicate RSS/Atom feeds
@@ -556,216 +544,172 @@ def create_fetch_server():
         # Smart URL rewriting (GitHub, etc.) — before any fetching
         original_url = url
         url, rewrite_note = await _rewrite_github_url(url)
-        if rewrite_note:
-            logfire.info(f"URL rewritten: {rewrite_note}", original=original_url, rewritten=url)
 
         # YouTube: extract metadata + transcript via yt-dlp (no HTTP fetch needed)
         yt_match = _YOUTUBE_RE.match(original_url)
         if yt_match:
             video_id = yt_match.group(1)
-            logfire.info("YouTube video detected", video_id=video_id, url=original_url)
             try:
                 return await _extract_youtube(original_url, video_id)
-            except Exception as e:
-                logfire.warning("YouTube extraction failed, falling through to HTTP", error=str(e))
-                # Fall through to normal HTTP fetch if yt-dlp fails
+            except Exception:
+                pass  # Fall through to normal HTTP fetch if yt-dlp fails
 
-        with logfire.span(
-            "mcp.fetch",
-            url=url,
-            original_url=original_url if rewrite_note else None,
-            render=render,
-        ) as span:
-            if rewrite_note:
-                span.set_attribute("rewrite", rewrite_note)
-
-            try:
-                # Tier 3: Cloudflare Browser Rendering (explicit opt-in)
-                if render:
-                    span.set_attribute("tier", "cloudflare_render")
-                    markdown = await _cloudflare_render(url)
-                    token_estimate = len(markdown) // 4  # Rough estimate
-                    span.set_attribute("result_type", "rendered_markdown")
-                    span.set_attribute("content_length", len(markdown))
-                    return {
-                        "content": [
-                            {"type": "text", "text": markdown},
-                            {"type": "text", "text": f"\n---\n*Rendered via Cloudflare Browser Rendering (~{token_estimate} tokens)*"},
-                        ]
-                    }
-
-                # Tier 1+2: Try Accept: text/markdown, fall back to html2text
-                content_type, body, headers = await _try_fetch(url)
-                span.set_attribute("content_type", content_type)
-                span.set_attribute("response_size", len(body))
-
-                # Check for markdown token count header (Cloudflare sites)
-                md_tokens = headers.get("x-markdown-tokens")
-                if md_tokens:
-                    span.set_attribute("markdown_tokens", md_tokens)
-
-                # Route by content type
-                if content_type == "text/markdown":
-                    # Tier 1: Got markdown directly!
-                    span.set_attribute("tier", "accept_markdown")
-                    span.set_attribute("result_type", "native_markdown")
-                    text = body.decode("utf-8", errors="replace")
-                    meta = f"\n---\n*Native markdown from {original_url}"
-                    if rewrite_note:
-                        meta += f" (rewritten: {rewrite_note})"
-                    if md_tokens:
-                        meta += f" ({md_tokens} tokens)"
-                    meta += "*"
-                    return {
-                        "content": [
-                            {"type": "text", "text": text},
-                            {"type": "text", "text": meta},
-                        ]
-                    }
-
-                elif content_type.startswith("image/"):
-                    # Image: return as viewable content block + saved path
-                    span.set_attribute("tier", "image")
-                    span.set_attribute("result_type", "image")
-                    image_block, thumb_path = await _process_image(body, content_type)
-                    content = [image_block]
-                    meta = f"Image from {original_url} ({content_type}, {len(body):,} bytes)"
-                    if thumb_path:
-                        meta += f"\n📷 {thumb_path} — Remember this?"
-                        span.set_attribute("thumbnail_path", thumb_path)
-                    content.append({"type": "text", "text": meta})
-
-                    # Image-triggered recall: caption → embed → search → breadcrumb
-                    if thumb_path and image_block.get("data"):
-                        recall_text = await _image_recall(image_block["data"])
-                        if recall_text:
-                            content.append({"type": "text", "text": recall_text})
-
-                    return {"content": content}
-
-                # Check for RSS/Atom feeds before HTML (some feeds use text/xml)
-                if content_type in _FEED_CONTENT_TYPES:
-                    feed_text = _parse_feed(body, url)
-                    if feed_text:
-                        span.set_attribute("tier", "feed")
-                        span.set_attribute("result_type", "rss_atom")
-                        return {
-                            "content": [
-                                {"type": "text", "text": feed_text},
-                                {"type": "text", "text": f"\n---\n*Feed from {original_url} ({content_type}, {len(body):,} bytes)*"},
-                            ]
-                        }
-                    # Not a real feed — continue to other handlers
-
-                if content_type in ("text/html", "application/xhtml+xml"):
-                    # Tier 2: HTML -> markdown via html2text
-                    span.set_attribute("tier", "html2text")
-                    span.set_attribute("result_type", "converted_markdown")
-                    markdown = await _html_to_markdown(body)
-                    span.set_attribute("content_length", len(markdown))
-                    return {
-                        "content": [
-                            {"type": "text", "text": markdown},
-                            {"type": "text", "text": f"\n---\n*Converted from HTML via html2text ({len(body):,} bytes){' — rewritten: ' + rewrite_note if rewrite_note else ''}*"},
-                        ]
-                    }
-
-                if content_type in ("application/json", "application/ld+json"):
-                    # JSON: return formatted inline
-                    span.set_attribute("tier", "json")
-                    span.set_attribute("result_type", "json")
-                    text = body.decode("utf-8", errors="replace")
-                    # Pretty-print if valid JSON
-                    try:
-                        parsed = json_mod.loads(text)
-                        text = json_mod.dumps(parsed, indent=2, ensure_ascii=False)
-                    except (json_mod.JSONDecodeError, ValueError):
-                        pass  # Return as-is if not valid JSON
-                    # Safety valve
-                    if len(text) > 500_000:
-                        text = text[:500_000] + f"\n\n[Truncated at 500K characters]"
-                    meta = f"\n---\n*JSON from {original_url}"
-                    if rewrite_note:
-                        meta += f" (rewritten: {rewrite_note})"
-                    meta += f" ({len(body):,} bytes)*"
-                    return {
-                        "content": [
-                            {"type": "text", "text": text},
-                            {"type": "text", "text": meta},
-                        ]
-                    }
-
-                if content_type == "application/pdf":
-                    # PDF: save to disk, return path for Read tool
-                    span.set_attribute("tier", "pdf")
-                    span.set_attribute("result_type", "saved_file")
-                    save_path = await _save_to_disk(body, url, ".pdf")
-                    span.set_attribute("save_path", save_path)
-                    return {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    f"PDF downloaded and saved to: {save_path}\n"
-                                    f"Size: {len(body):,} bytes\n\n"
-                                    f"Use the Read tool to view it: Read({save_path})"
-                                ),
-                            }
-                        ]
-                    }
-
-                # Fallback: unknown binary type → save to disk
-                if not content_type.startswith("text/"):
-                    span.set_attribute("tier", "binary_save")
-                    span.set_attribute("result_type", "saved_file")
-                    ext = _ext_from_content_type(content_type)
-                    save_path = await _save_to_disk(body, url, ext)
-                    span.set_attribute("save_path", save_path)
-                    return {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    f"Binary file ({content_type}) saved to: {save_path}\n"
-                                    f"Size: {len(body):,} bytes"
-                                ),
-                            }
-                        ]
-                    }
-
-                # Fallback: text content, return raw
-                span.set_attribute("tier", "raw")
-                span.set_attribute("result_type", "raw_text")
-                text = body.decode("utf-8", errors="replace")
-                if len(text) > 500_000:
-                    text = text[:500_000] + f"\n\n[Truncated at 500K characters, full size was {len(body):,} bytes]"
+        try:
+            # Tier 3: Cloudflare Browser Rendering (explicit opt-in)
+            if render:
+                markdown = await _cloudflare_render(url)
+                token_estimate = len(markdown) // 4  # Rough estimate
                 return {
                     "content": [
-                        {"type": "text", "text": text},
-                        {"type": "text", "text": f"\n---\n*Raw content from {original_url} ({content_type}){' — rewritten: ' + rewrite_note if rewrite_note else ''}*"},
+                        {"type": "text", "text": markdown},
+                        {"type": "text", "text": f"\n---\n*Rendered via Cloudflare Browser Rendering (~{token_estimate} tokens)*"},
                     ]
                 }
 
-            except httpx.HTTPStatusError as e:
-                logfire.warning("Fetch HTTP error", url=url, status=e.response.status_code)
+            # Tier 1+2: Try Accept: text/markdown, fall back to html2text
+            content_type, body, headers = await _try_fetch(url)
+
+            # Check for markdown token count header (Cloudflare sites)
+            md_tokens = headers.get("x-markdown-tokens")
+
+            # Route by content type
+            if content_type == "text/markdown":
+                # Tier 1: Got markdown directly!
+                text = body.decode("utf-8", errors="replace")
+                meta = f"\n---\n*Native markdown from {original_url}"
+                if rewrite_note:
+                    meta += f" (rewritten: {rewrite_note})"
+                if md_tokens:
+                    meta += f" ({md_tokens} tokens)"
+                meta += "*"
                 return {
-                    "content": [{"type": "text", "text": f"HTTP {e.response.status_code} fetching {url}"}]
+                    "content": [
+                        {"type": "text", "text": text},
+                        {"type": "text", "text": meta},
+                    ]
                 }
-            except httpx.ConnectError:
-                logfire.warning("Fetch connection error", url=url)
+
+            elif content_type.startswith("image/"):
+                # Image: return as viewable content block + saved path
+                image_block, thumb_path = await _process_image(body, content_type)
+                content = [image_block]
+                meta = f"Image from {original_url} ({content_type}, {len(body):,} bytes)"
+                if thumb_path:
+                    meta += f"\n📷 {thumb_path} — Remember this?"
+                content.append({"type": "text", "text": meta})
+
+                # Image-triggered recall: caption → embed → search → breadcrumb
+                if thumb_path and image_block.get("data"):
+                    recall_text = await _image_recall(image_block["data"])
+                    if recall_text:
+                        content.append({"type": "text", "text": recall_text})
+
+                return {"content": content}
+
+            # Check for RSS/Atom feeds before HTML (some feeds use text/xml)
+            if content_type in _FEED_CONTENT_TYPES:
+                feed_text = _parse_feed(body, url)
+                if feed_text:
+                    return {
+                        "content": [
+                            {"type": "text", "text": feed_text},
+                            {"type": "text", "text": f"\n---\n*Feed from {original_url} ({content_type}, {len(body):,} bytes)*"},
+                        ]
+                    }
+                # Not a real feed — continue to other handlers
+
+            if content_type in ("text/html", "application/xhtml+xml"):
+                # Tier 2: HTML -> markdown via html2text
+                markdown = await _html_to_markdown(body)
                 return {
-                    "content": [{"type": "text", "text": f"Could not connect to {url}"}]
+                    "content": [
+                        {"type": "text", "text": markdown},
+                        {"type": "text", "text": f"\n---\n*Converted from HTML via html2text ({len(body):,} bytes){' — rewritten: ' + rewrite_note if rewrite_note else ''}*"},
+                    ]
                 }
-            except httpx.TimeoutException:
-                logfire.warning("Fetch timeout", url=url)
+
+            if content_type in ("application/json", "application/ld+json"):
+                # JSON: return formatted inline
+                text = body.decode("utf-8", errors="replace")
+                # Pretty-print if valid JSON
+                try:
+                    parsed = json_mod.loads(text)
+                    text = json_mod.dumps(parsed, indent=2, ensure_ascii=False)
+                except (json_mod.JSONDecodeError, ValueError):
+                    pass  # Return as-is if not valid JSON
+                # Safety valve
+                if len(text) > 500_000:
+                    text = text[:500_000] + f"\n\n[Truncated at 500K characters]"
+                meta = f"\n---\n*JSON from {original_url}"
+                if rewrite_note:
+                    meta += f" (rewritten: {rewrite_note})"
+                meta += f" ({len(body):,} bytes)*"
                 return {
-                    "content": [{"type": "text", "text": f"Timeout fetching {url} (30s limit)"}]
+                    "content": [
+                        {"type": "text", "text": text},
+                        {"type": "text", "text": meta},
+                    ]
                 }
-            except Exception as e:
-                logfire.error("Fetch error", url=url, error=str(e))
+
+            if content_type == "application/pdf":
+                # PDF: save to disk, return path for Read tool
+                save_path = await _save_to_disk(body, url, ".pdf")
                 return {
-                    "content": [{"type": "text", "text": f"Error fetching {url}: {e}"}]
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                f"PDF downloaded and saved to: {save_path}\n"
+                                f"Size: {len(body):,} bytes\n\n"
+                                f"Use the Read tool to view it: Read({save_path})"
+                            ),
+                        }
+                    ]
                 }
+
+            # Fallback: unknown binary type → save to disk
+            if not content_type.startswith("text/"):
+                ext = _ext_from_content_type(content_type)
+                save_path = await _save_to_disk(body, url, ext)
+                return {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                f"Binary file ({content_type}) saved to: {save_path}\n"
+                                f"Size: {len(body):,} bytes"
+                            ),
+                        }
+                    ]
+                }
+
+            # Fallback: text content, return raw
+            text = body.decode("utf-8", errors="replace")
+            if len(text) > 500_000:
+                text = text[:500_000] + f"\n\n[Truncated at 500K characters, full size was {len(body):,} bytes]"
+            return {
+                "content": [
+                    {"type": "text", "text": text},
+                    {"type": "text", "text": f"\n---\n*Raw content from {original_url} ({content_type}){' — rewritten: ' + rewrite_note if rewrite_note else ''}*"},
+                ]
+            }
+
+        except httpx.HTTPStatusError as e:
+            return {
+                "content": [{"type": "text", "text": f"HTTP {e.response.status_code} fetching {url}"}]
+            }
+        except httpx.ConnectError:
+            return {
+                "content": [{"type": "text", "text": f"Could not connect to {url}"}]
+            }
+        except httpx.TimeoutException:
+            return {
+                "content": [{"type": "text", "text": f"Timeout fetching {url} (30s limit)"}]
+            }
+        except Exception as e:
+            return {
+                "content": [{"type": "text", "text": f"Error fetching {url}: {e}"}]
+            }
 
     # Bundle into MCP server
     return create_sdk_mcp_server(

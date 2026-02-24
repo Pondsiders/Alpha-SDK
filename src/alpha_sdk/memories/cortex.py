@@ -8,8 +8,6 @@ Higher-level functions (recall, suggest) build on these.
 from datetime import datetime
 from typing import Any
 
-import logfire
-
 from .embeddings import embed_document, embed_query, EmbeddingError
 from .images import create_thumbnail
 from .db import (
@@ -57,44 +55,33 @@ async def store(
     Returns:
         Dict with id, created_at, and optionally thumbnail_path; or None on failure
     """
-    with logfire.span("cortex.store", memory_preview=memory[:50]) as span:
-        try:
-            # Generate embedding
-            embedding = await embed_document(memory)
+    try:
+        # Generate embedding
+        embedding = await embed_document(memory)
 
-            # Process image if provided — create thumbnail, store path
-            thumbnail_path = None
-            if image:
-                thumbnail_path = create_thumbnail(image)
-                if thumbnail_path:
-                    span.set_attribute("image_attached", True)
-                    span.set_attribute("thumbnail_path", thumbnail_path)
-                    logfire.info(f"Image attached: {image} → {thumbnail_path}")
-                else:
-                    logfire.warning(f"Image thumbnail failed for: {image}")
+        # Process image if provided — create thumbnail, store path
+        thumbnail_path = None
+        if image:
+            thumbnail_path = create_thumbnail(image)
 
-            # Store in database
-            memory_id, created_at = await store_memory(
-                content=memory,
-                embedding=embedding,
-                tags=tags,
-                timezone_str=timezone,
-                image_path=thumbnail_path,
-            )
+        # Store in database
+        memory_id, created_at = await store_memory(
+            content=memory,
+            embedding=embedding,
+            tags=tags,
+            timezone_str=timezone,
+            image_path=thumbnail_path,
+        )
 
-            span.set_attribute("memory_id", memory_id)
-            logfire.info(f"Memory stored: #{memory_id}")
-            result = {"id": memory_id, "created_at": created_at.isoformat()}
-            if thumbnail_path:
-                result["thumbnail_path"] = thumbnail_path
-            return result
+        result = {"id": memory_id, "created_at": created_at.isoformat()}
+        if thumbnail_path:
+            result["thumbnail_path"] = thumbnail_path
+        return result
 
-        except EmbeddingError as e:
-            logfire.error("Embedding failed during store", error=str(e))
-            return None
-        except Exception as e:
-            logfire.error("Cortex store failed", error=str(e))
-            return None
+    except EmbeddingError:
+        return None
+    except Exception:
+        return None
 
 
 async def search(
@@ -122,50 +109,45 @@ async def search(
     Returns:
         List of memory dicts with id, content, created_at, score
     """
-    with logfire.span("cortex.search", query_preview=query[:50], exclude_count=len(exclude or [])) as span:
-        try:
-            # Generate query embedding (unless exact match only)
-            query_embedding = None
-            if not exact:
-                query_embedding = await embed_query(query)
+    try:
+        # Generate query embedding (unless exact match only)
+        query_embedding = None
+        if not exact:
+            query_embedding = await embed_query(query)
 
-            # Search database
-            results = await search_memories(
-                query_embedding=query_embedding,
-                query_text=query,
-                limit=limit,
-                include_forgotten=include_forgotten,
-                exact=exact,
-                after=after,
-                before=before,
-                exclude=exclude,
-                min_score=min_score,
-            )
+        # Search database
+        results = await search_memories(
+            query_embedding=query_embedding,
+            query_text=query,
+            limit=limit,
+            include_forgotten=include_forgotten,
+            exact=exact,
+            after=after,
+            before=before,
+            exclude=exclude,
+            min_score=min_score,
+        )
 
-            # Transform to expected format
-            memories = []
-            for item in results:
-                metadata = item.get("metadata", {})
-                mem = {
-                    "id": item["id"],
-                    "content": item["content"],
-                    "created_at": metadata.get("created_at", ""),
-                    "score": item.get("score"),
-                }
-                if metadata.get("image_path"):
-                    mem["image_path"] = metadata["image_path"]
-                memories.append(mem)
+        # Transform to expected format
+        memories = []
+        for item in results:
+            metadata = item.get("metadata", {})
+            mem = {
+                "id": item["id"],
+                "content": item["content"],
+                "created_at": metadata.get("created_at", ""),
+                "score": item.get("score"),
+            }
+            if metadata.get("image_path"):
+                mem["image_path"] = metadata["image_path"]
+            memories.append(mem)
 
-            span.set_attribute("result_count", len(memories))
-            logfire.debug("Cortex search complete", query_preview=query[:30], results=len(memories))
-            return memories
+        return memories
 
-        except EmbeddingError as e:
-            logfire.error("Embedding failed during search", error=str(e))
-            return []
-        except Exception as e:
-            logfire.error("Cortex search failed", error=str(e))
-            return []
+    except EmbeddingError:
+        return []
+    except Exception:
+        return []
 
 
 async def recent(limit: int = 10, hours: int = 24) -> list[dict[str, Any]]:
@@ -178,30 +160,26 @@ async def recent(limit: int = 10, hours: int = 24) -> list[dict[str, Any]]:
     Returns:
         List of memory dicts with id, content, created_at
     """
-    with logfire.span("cortex.recent", limit=limit, hours=hours) as span:
-        try:
-            results = await get_recent_memories(limit=limit, hours=hours)
+    try:
+        results = await get_recent_memories(limit=limit, hours=hours)
 
-            # Transform to expected format
-            memories = []
-            for item in results:
-                metadata = item.get("metadata", {})
-                mem = {
-                    "id": item["id"],
-                    "content": item["content"],
-                    "created_at": metadata.get("created_at", ""),
-                }
-                if metadata.get("image_path"):
-                    mem["image_path"] = metadata["image_path"]
-                memories.append(mem)
+        # Transform to expected format
+        memories = []
+        for item in results:
+            metadata = item.get("metadata", {})
+            mem = {
+                "id": item["id"],
+                "content": item["content"],
+                "created_at": metadata.get("created_at", ""),
+            }
+            if metadata.get("image_path"):
+                mem["image_path"] = metadata["image_path"]
+            memories.append(mem)
 
-            span.set_attribute("result_count", len(memories))
-            logfire.debug("Cortex recent complete", results=len(memories))
-            return memories
+        return memories
 
-        except Exception as e:
-            logfire.error("Cortex recent failed", error=str(e))
-            return []
+    except Exception:
+        return []
 
 
 async def get(memory_id: int) -> dict[str, Any] | None:
@@ -228,8 +206,7 @@ async def get(memory_id: int) -> dict[str, Any] | None:
         if metadata.get("image_path"):
             mem["image_path"] = metadata["image_path"]
         return mem
-    except Exception as e:
-        logfire.error("Cortex get failed", error=str(e))
+    except Exception:
         return None
 
 
@@ -244,8 +221,7 @@ async def forget(memory_id: int) -> bool:
     """
     try:
         return await forget_memory(memory_id)
-    except Exception as e:
-        logfire.error("Cortex forget failed", error=str(e))
+    except Exception:
         return False
 
 

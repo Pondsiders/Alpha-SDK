@@ -1,6 +1,6 @@
 """Memory suggestion - what's memorable from this turn?
 
-After each turn completes, asks OLMo what moments are worth remembering.
+After each turn completes, asks the local LLM what moments are worth remembering.
 Results are returned to the caller (AlphaClient) for injection on the next turn.
 
 This is fire-and-forget - call it as an asyncio task after turn completes.
@@ -8,10 +8,8 @@ This is fire-and-forget - call it as an asyncio task after turn completes.
 
 import json
 import os
-from typing import Any
 
 import httpx
-import logfire
 
 # Configuration from environment
 OLLAMA_URL = os.environ.get("OLLAMA_URL")
@@ -77,7 +75,7 @@ Respond with a JSON array of strings. Empty array [] if nothing notable.
 
 
 def _parse_memorables(text: str) -> list[str]:
-    """Parse JSON array of strings from OLMo output."""
+    """Parse JSON array of strings from local LLM output."""
     if not text:
         return []
 
@@ -88,7 +86,6 @@ def _parse_memorables(text: str) -> list[str]:
     end = text.rfind("]") + 1
 
     if start == -1 or end == 0:
-        logfire.warning("No JSON array found in OLMo output", raw=text[:200])
         return []
 
     try:
@@ -96,15 +93,13 @@ def _parse_memorables(text: str) -> list[str]:
         if isinstance(result, list):
             return [s.strip() for s in result if isinstance(s, str) and s.strip()]
         return []
-    except json.JSONDecodeError as e:
-        logfire.warning("Failed to parse OLMo JSON", error=str(e), raw=text[:200])
+    except json.JSONDecodeError:
         return []
 
 
-async def _call_olmo(user_content: str, assistant_content: str) -> list[str]:
-    """Ask OLMo what's memorable from this turn."""
+async def _call_llm(user_content: str, assistant_content: str) -> list[str]:
+    """Ask the local LLM what's memorable from this turn."""
     if not OLLAMA_URL or not OLLAMA_MODEL:
-        logfire.warning("OLLAMA not configured, skipping suggest")
         return []
 
     user_prompt = TURN_PROMPT_TEMPLATE.format(
@@ -112,44 +107,29 @@ async def _call_olmo(user_content: str, assistant_content: str) -> list[str]:
         assistant_content=assistant_content[:4000],
     )
 
-    with logfire.span(
-        "suggest.olmo",
-        **{
-            "gen_ai.operation.name": "chat",
-            "gen_ai.provider.name": "ollama",
-            "gen_ai.request.model": OLLAMA_MODEL,
-        }
-    ) as span:
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    f"{OLLAMA_URL}/api/chat",
-                    json={
-                        "model": OLLAMA_MODEL,
-                        "messages": [
-                            {"role": "system", "content": INTRO_SYSTEM_PROMPT},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                        "stream": False,
-                        "options": {"num_ctx": 8192},
-                    },
-                )
-                response.raise_for_status()
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{OLLAMA_URL}/api/chat",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "messages": [
+                        {"role": "system", "content": INTRO_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "stream": False,
+                    "options": {"num_ctx": 8192},
+                },
+            )
+            response.raise_for_status()
 
-            result = response.json()
-            output = result.get("message", {}).get("content", "")
+        result = response.json()
+        output = result.get("message", {}).get("content", "")
 
-            span.set_attribute("gen_ai.usage.input_tokens", result.get("prompt_eval_count", 0))
-            span.set_attribute("gen_ai.usage.output_tokens", result.get("eval_count", 0))
-            span.set_attribute("gen_ai.response.model", OLLAMA_MODEL)
+        return _parse_memorables(output)
 
-            memorables = _parse_memorables(output)
-            logfire.info("OLMo memorables extracted", count=len(memorables))
-            return memorables
-
-        except Exception as e:
-            logfire.error("OLMo suggest failed", error=str(e))
-            return []
+    except Exception:
+        return []
 
 
 async def suggest(user_content: str, assistant_content: str, session_id: str) -> list[str]:
@@ -167,12 +147,4 @@ async def suggest(user_content: str, assistant_content: str, session_id: str) ->
     Returns:
         List of memorable strings (empty if nothing notable)
     """
-    with logfire.span("suggest", session_id=session_id[:8] if session_id else "none"):
-        memorables = await _call_olmo(user_content, assistant_content)
-
-        if memorables:
-            logfire.info("Memorables extracted", session_id=session_id[:8], count=len(memorables))
-        else:
-            logfire.debug("No memorables this turn")
-
-        return memorables
+    return await _call_llm(user_content, assistant_content)

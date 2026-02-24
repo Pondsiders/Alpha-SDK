@@ -11,7 +11,6 @@ The 'autoload' key controls what gets injected:
 from pathlib import Path
 
 import frontmatter
-import logfire
 
 CONTEXT_ROOT = Path("/Pondside")
 CONTEXT_FILE_NAME = "ALPHA.md"
@@ -20,7 +19,6 @@ CONTEXT_FILE_NAME = "ALPHA.md"
 def find_context_files(root: Path = CONTEXT_ROOT) -> list[Path]:
     """Walk directory tree finding ALPHA.md files."""
     if not root.exists():
-        logfire.warning(f"Context root does not exist: {root}")
         return []
 
     context_files = []
@@ -56,16 +54,11 @@ def load_context() -> tuple[list[dict], list[str]]:
                     "path": str(rel_path),
                     "content": post.content.strip(),
                 })
-                logfire.debug(f"Loaded full context from {rel_path}")
 
             elif autoload == "when" and when:
                 when_hints.append(f"`Read({rel_path})` — **Topics:** {when}")
-                logfire.debug(f"Added context hint for {rel_path}")
 
-        except Exception as e:
-            logfire.warning(f"Failed to load context file {path}: {e}")
-
-    if all_blocks or when_hints:
-        logfire.debug(f"Loaded {len(all_blocks)} context(s), {len(when_hints)} hint(s)")
+        except Exception:
+            pass
 
     return all_blocks, when_hints

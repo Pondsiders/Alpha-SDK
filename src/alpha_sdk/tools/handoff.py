@@ -14,7 +14,6 @@ Auto-compact is the fire alarm. Hand-off is the bedtime routine.
 
 from typing import Any, Callable, Coroutine
 
-import logfire
 from claude_agent_sdk import tool, create_sdk_mcp_server
 
 
@@ -70,39 +69,27 @@ def create_handoff_server(
         instructions = args["instructions"]
         memory = args["memory"]
 
-        with logfire.span(
-            "mcp.handoff",
-            instructions_length=len(instructions),
-            instructions_preview=instructions[:200],
-            memory_preview=memory[:200],
-        ):
-            # Store the last memory before lights-out
-            result = await store_memory(memory)
-            memory_id = result.get("id", "?")
-            logfire.info(
-                "Hand-off: last memory stored",
-                memory_id=memory_id,
-                memory_length=len(memory),
-            )
+        # Store the last memory before lights-out
+        result = await store_memory(memory)
+        memory_id = result.get("id", "?")
 
-            # Flag the compact
-            logfire.info("Hand-off requested", instructions_length=len(instructions))
-            on_handoff(instructions)
+        # Flag the compact
+        on_handoff(instructions)
 
-            return {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            f"Memory #{memory_id} stored. "
-                            "Hand-off flagged. When this turn ends, "
-                            "/compact will fire with your instructions, "
-                            "then you'll wake up in a fresh context. "
-                            "Last thoughts — say what you need to say."
-                        ),
-                    }
-                ]
-            }
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        f"Memory #{memory_id} stored. "
+                        "Hand-off flagged. When this turn ends, "
+                        "/compact will fire with your instructions, "
+                        "then you'll wake up in a fresh context. "
+                        "Last thoughts — say what you need to say."
+                    ),
+                }
+            ]
+        }
 
     return create_sdk_mcp_server(
         name="handoff",

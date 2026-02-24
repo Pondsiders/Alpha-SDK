@@ -18,7 +18,6 @@ import os
 from typing import Any
 
 import httpx
-import logfire
 
 from claude_agent_sdk import tool, create_sdk_mcp_server
 
@@ -74,101 +73,81 @@ def create_forge_server():
         """Generate an image via Forge and return it as a viewable content block."""
         prompt = args["prompt"]
 
-        with logfire.span(
-            "mcp.forge.imagine",
-            prompt_preview=prompt[:100],
-            forge_url=FORGE_URL,
-        ):
-            try:
-                # Build the request payload with 3:2 landscape defaults
-                payload: dict[str, Any] = {
-                    "prompt": prompt,
-                    "width": args.get("width", 1152),
-                    "height": args.get("height", 768),
-                }
-                if "negative_prompt" in args:
-                    payload["negative_prompt"] = args["negative_prompt"]
-                if "steps" in args:
-                    payload["steps"] = args["steps"]
-                if "seed" in args:
-                    payload["seed"] = args["seed"]
+        try:
+            # Build the request payload with 3:2 landscape defaults
+            payload: dict[str, Any] = {
+                "prompt": prompt,
+                "width": args.get("width", 1152),
+                "height": args.get("height", 768),
+            }
+            if "negative_prompt" in args:
+                payload["negative_prompt"] = args["negative_prompt"]
+            if "steps" in args:
+                payload["steps"] = args["steps"]
+            if "seed" in args:
+                payload["seed"] = args["seed"]
 
-                # Call Forge
-                async with httpx.AsyncClient() as client:
-                    resp = await client.post(
-                        f"{FORGE_URL}/imagine",
-                        json=payload,
-                        timeout=300.0,  # Image generation can take a while
-                    )
-
-                if resp.status_code != 200:
-                    error_text = resp.text[:500]
-                    logfire.error("Forge imagine failed", status=resp.status_code, error=error_text)
-                    return {"content": [{"type": "text", "text": f"Image generation failed (HTTP {resp.status_code}): {error_text}"}]}
-
-                result = resp.json()
-                image_b64 = result.get("base64", "")
-                image_path = result.get("path", "unknown")
-                gen_time = result.get("generation_time", 0)
-                model = result.get("model", "unknown")
-
-                logfire.info(
-                    "Image generated",
-                    path=image_path,
-                    generation_time=gen_time,
-                    model=model,
+            # Call Forge
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{FORGE_URL}/imagine",
+                    json=payload,
+                    timeout=300.0,  # Image generation can take a while
                 )
 
-                # Re-encode to JPEG/80 for context delivery.
-                # Forge saves at JPEG/90 — re-encoding at 80 shaves ~30% off
-                # the base64 for minimal quality loss. No downscaling: the dream
-                # IS the right size already (1152x768 ≈ 464 tokens, ~200 KB).
-                import base64 as b64_mod
-                from io import BytesIO
-                from PIL import Image
+            if resp.status_code != 200:
+                error_text = resp.text[:500]
+                return {"content": [{"type": "text", "text": f"Image generation failed (HTTP {resp.status_code}): {error_text}"}]}
 
-                raw_bytes = b64_mod.b64decode(image_b64)
-                img = Image.open(BytesIO(raw_bytes))
-                if img.mode != "RGB":
-                    img = img.convert("RGB")
-                w, h = img.size
-                buf = BytesIO()
-                img.save(buf, format="JPEG", quality=80, optimize=True)
-                delivery_b64 = b64_mod.b64encode(buf.getvalue()).decode("utf-8")
-                logfire.info(
-                    f"Dream for MCP: {w}x{h} JPEG/80 "
-                    f"({len(delivery_b64)} chars b64, ~{len(delivery_b64) // 1024} KB)",
-                )
+            result = resp.json()
+            image_b64 = result.get("base64", "")
+            image_path = result.get("path", "unknown")
+            gen_time = result.get("generation_time", 0)
+            model = result.get("model", "unknown")
 
-                # MCP spec image format: "type": "image", "data": base64, "mimeType": mime
-                return {
-                    "content": [
-                        {
-                            "type": "image",
-                            "data": delivery_b64,
-                            "mimeType": "image/jpeg",
-                        },
-                        {
-                            "type": "text",
-                            "text": (
-                                f"Image generated and saved to {image_path}\n"
-                                f"Model: {model}\n"
-                                f"Generation time: {gen_time:.1f}s\n"
-                                f"Prompt: {prompt}"
-                            ),
-                        },
-                    ]
-                }
+            # Re-encode to JPEG/80 for context delivery.
+            # Forge saves at JPEG/90 — re-encoding at 80 shaves ~30% off
+            # the base64 for minimal quality loss. No downscaling: the dream
+            # IS the right size already (1152x768 ≈ 464 tokens, ~200 KB).
+            import base64 as b64_mod
+            from io import BytesIO
+            from PIL import Image
 
-            except httpx.ConnectError:
-                logfire.warning("Forge unreachable", url=FORGE_URL)
-                return {"content": [{"type": "text", "text": f"Forge is not running at {FORGE_URL}. Start Forge on primer to enable image generation."}]}
-            except httpx.TimeoutException:
-                logfire.warning("Forge imagine timed out")
-                return {"content": [{"type": "text", "text": "Image generation timed out (>5 minutes). The model may still be loading."}]}
-            except Exception as e:
-                logfire.error("Forge imagine error", error=str(e))
-                return {"content": [{"type": "text", "text": f"Error generating image: {e}"}]}
+            raw_bytes = b64_mod.b64decode(image_b64)
+            img = Image.open(BytesIO(raw_bytes))
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            w, h = img.size
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=80, optimize=True)
+            delivery_b64 = b64_mod.b64encode(buf.getvalue()).decode("utf-8")
+
+            # MCP spec image format: "type": "image", "data": base64, "mimeType": mime
+            return {
+                "content": [
+                    {
+                        "type": "image",
+                        "data": delivery_b64,
+                        "mimeType": "image/jpeg",
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            f"Image generated and saved to {image_path}\n"
+                            f"Model: {model}\n"
+                            f"Generation time: {gen_time:.1f}s\n"
+                            f"Prompt: {prompt}"
+                        ),
+                    },
+                ]
+            }
+
+        except httpx.ConnectError:
+            return {"content": [{"type": "text", "text": f"Forge is not running at {FORGE_URL}. Start Forge on primer to enable image generation."}]}
+        except httpx.TimeoutException:
+            return {"content": [{"type": "text", "text": "Image generation timed out (>5 minutes). The model may still be loading."}]}
+        except Exception as e:
+            return {"content": [{"type": "text", "text": f"Error generating image: {e}"}]}
 
     # Bundle into MCP server
     return create_sdk_mcp_server(

@@ -8,8 +8,6 @@ import os
 import subprocess
 from pathlib import Path
 
-import logfire
-
 # Configuration
 SOUL_REPO_PATH = Path(os.environ.get(
     "ALPHA_SOUL_REPO",
@@ -36,10 +34,9 @@ def _read_from_git(filename: str, ref: str = "HEAD") -> str | None:
             timeout=5,
         )
         if result.returncode != 0:
-            logfire.warning(f"git show {ref}:{filename} failed: {result.stderr}")
             return None
 
-        commit = subprocess.run(
+        subprocess.run(
             ["git", "rev-parse", "--short", ref],
             cwd=SOUL_REPO_PATH,
             capture_output=True,
@@ -47,19 +44,15 @@ def _read_from_git(filename: str, ref: str = "HEAD") -> str | None:
             timeout=5,
         ).stdout.strip()
 
-        logfire.debug(f"Loaded {filename} from git (commit={commit}, {len(result.stdout)} chars)")
         return result.stdout
 
-    except Exception as e:
-        logfire.error(f"Failed to read {filename} from git: {e}")
+    except Exception:
         return None
 
 
 def init() -> None:
     """Initialize the soul at startup. Call once."""
     global _soul_prompt, _bill_of_rights, _compact_prompt
-
-    logfire.debug("Initializing Alpha soul...")
 
     _soul_prompt = _read_from_git(SOUL_FILE)
     if _soul_prompt is None:
@@ -68,12 +61,8 @@ def init() -> None:
         )
 
     _bill_of_rights = _read_from_git(BILL_OF_RIGHTS_FILE)
-    if _bill_of_rights is None:
-        logfire.warning("Bill of rights not loaded, will proceed without it")
 
     _compact_prompt = _read_from_git(COMPACT_FILE)
-    if _compact_prompt is None:
-        logfire.warning("Compact prompt not loaded, will use fallback")
 
 
 def get_soul() -> str:

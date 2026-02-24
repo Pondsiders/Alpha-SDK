@@ -13,8 +13,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-import logfire
-
 from .memories.db import get_pool
 from .memories.embeddings import embed_document
 
@@ -48,47 +46,37 @@ def _extract_text_content(content: str | list[Any]) -> str:
 
 async def _embed_and_update(row_id: int, content: str) -> bool:
     """Embed content and update the row. Returns success status."""
-    with logfire.span("archive.embed", row_id=row_id, content_len=len(content)):
-        try:
-            embedding = await embed_document(content)
+    try:
+        embedding = await embed_document(content)
 
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    UPDATE scribe.messages
-                    SET embedding = $1::vector
-                    WHERE id = $2
-                    """,
-                    str(embedding),  # pgvector accepts string representation
-                    row_id,
-                )
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE scribe.messages
+                SET embedding = $1::vector
+                WHERE id = $2
+                """,
+                str(embedding),
+                row_id,
+            )
 
-            logfire.debug(f"Embedded archive row {row_id}")
-            return True
+        return True
 
-        except Exception as e:
-            logfire.error("Archive embed failed", row_id=row_id, error=str(e))
-            return False
+    except Exception:
+        return False
 
 
 async def _embed_rows(row_ids: list[int], contents: list[str]) -> None:
-    """Embed multiple rows in parallel. Fire-and-forget, logs results."""
+    """Embed multiple rows in parallel. Fire-and-forget."""
     if not row_ids:
         return
 
-    with logfire.span("archive.embed_batch", count=len(row_ids)):
-        tasks = [
-            _embed_and_update(row_id, content)
-            for row_id, content in zip(row_ids, contents)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        successes = sum(1 for r in results if r is True)
-        failures = len(results) - successes
-
-        if failures > 0:
-            logfire.warning("Archive embedding had failures", successes=successes, failures=failures)
+    tasks = [
+        _embed_and_update(row_id, content)
+        for row_id, content in zip(row_ids, contents)
+    ]
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def archive_turn(
@@ -124,65 +112,53 @@ async def archive_turn(
     if not user_text.strip() and not assistant_content.strip():
         return ArchiveResult(success=True, rows_inserted=0)  # Nothing to archive
 
-    with logfire.span(
-        "archive.turn",
-        session_id=session_id[:8] if session_id else "none",
-        user_len=len(user_text),
-        assistant_len=len(assistant_content),
-    ):
-        try:
-            pool = await get_pool()
+    try:
+        pool = await get_pool()
 
-            # Build rows to insert
-            rows: list[tuple[datetime, str, str, str | None]] = []
-            contents: list[str] = []  # For embedding later
+        # Build rows to insert
+        rows: list[tuple[datetime, str, str, str | None]] = []
+        contents: list[str] = []  # For embedding later
 
-            if user_text.strip():
-                rows.append((timestamp, "human", user_text, session_id))
-                contents.append(user_text)
+        if user_text.strip():
+            rows.append((timestamp, "human", user_text, session_id))
+            contents.append(user_text)
 
-            if assistant_content.strip():
-                # Slight offset for assistant timestamp to maintain ordering
-                assistant_ts = timestamp.replace(microsecond=min(timestamp.microsecond + 1, 999999))
-                rows.append((assistant_ts, "assistant", assistant_content, session_id))
-                contents.append(assistant_content)
+        if assistant_content.strip():
+            # Slight offset for assistant timestamp to maintain ordering
+            assistant_ts = timestamp.replace(microsecond=min(timestamp.microsecond + 1, 999999))
+            rows.append((assistant_ts, "assistant", assistant_content, session_id))
+            contents.append(assistant_content)
 
-            if not rows:
-                return ArchiveResult(success=True, rows_inserted=0)
+        if not rows:
+            return ArchiveResult(success=True, rows_inserted=0)
 
-            # Insert into Postgres, returning IDs
-            # Track which rows actually got inserted (not skipped by ON CONFLICT)
-            row_ids: list[int] = []
-            inserted_contents: list[str] = []
-            async with pool.acquire() as conn:
-                for i, row in enumerate(rows):
-                    result = await conn.fetchval(
-                        """
-                        INSERT INTO scribe.messages (timestamp, role, content, session_id)
-                        VALUES ($1, $2, $3, $4)
-                        ON CONFLICT (timestamp, role, md5(content)) DO NOTHING
-                        RETURNING id
-                        """,
-                        row[0], row[1], row[2], row[3],
-                    )
-                    if result:
-                        row_ids.append(result)
-                        inserted_contents.append(contents[i])
+        # Insert into Postgres, returning IDs
+        row_ids: list[int] = []
+        inserted_contents: list[str] = []
+        async with pool.acquire() as conn:
+            for i, row in enumerate(rows):
+                result = await conn.fetchval(
+                    """
+                    INSERT INTO scribe.messages (timestamp, role, content, session_id)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (timestamp, role, md5(content)) DO NOTHING
+                    RETURNING id
+                    """,
+                    row[0], row[1], row[2], row[3],
+                )
+                if result:
+                    row_ids.append(result)
+                    inserted_contents.append(contents[i])
 
-            sid_short = session_id[:8] if session_id else "none"
-            logfire.info("Archived turn", rows=len(row_ids), session_id=sid_short)
+        # Fire off embedding task (non-blocking)
+        if row_ids:
+            asyncio.create_task(_embed_rows(row_ids, inserted_contents))
 
-            # Fire off embedding task (non-blocking)
-            if row_ids:
-                asyncio.create_task(_embed_rows(row_ids, inserted_contents))
+        return ArchiveResult(
+            success=True,
+            rows_inserted=len(row_ids),
+            row_ids=row_ids,
+        )
 
-            return ArchiveResult(
-                success=True,
-                rows_inserted=len(row_ids),
-                row_ids=row_ids,
-            )
-
-        except Exception as e:
-            error_msg = f"Archive failed: {e}"
-            logfire.error(error_msg, error=str(e))
-            return ArchiveResult(success=False, error=error_msg)
+    except Exception as e:
+        return ArchiveResult(success=False, error=f"Archive failed: {e}")

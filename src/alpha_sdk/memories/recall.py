@@ -17,7 +17,6 @@ import os
 from typing import Any
 
 import httpx
-import logfire
 
 from .cortex import search as cortex_search
 
@@ -92,56 +91,37 @@ async def _extract_queries(message: str) -> list[str]:
     Returns 0-3 descriptive queries, or empty list if message doesn't warrant search.
     """
     if not OLLAMA_URL or not OLLAMA_MODEL:
-        logfire.debug("OLLAMA not configured, skipping query extraction")
         return []
 
     prompt = QUERY_EXTRACTION_PROMPT.format(message=message[:2000])
 
-    with logfire.span(
-        "recall.extract_queries",
-        **{
-            "gen_ai.operation.name": "chat",
-            "gen_ai.provider.name": "ollama",
-            "gen_ai.request.model": OLLAMA_MODEL,
-        }
-    ) as span:
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                response = await client.post(
-                    f"{OLLAMA_URL}/api/chat",
-                    json={
-                        "model": OLLAMA_MODEL,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "stream": False,
-                        "format": "json",
-                        "options": {"num_ctx": 4096},
-                    },
-                )
-                response.raise_for_status()
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                f"{OLLAMA_URL}/api/chat",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "format": "json",
+                    "options": {"num_ctx": 4096},
+                },
+            )
+            response.raise_for_status()
 
-            result = response.json()
-            output = result.get("message", {}).get("content", "")
+        result = response.json()
+        output = result.get("message", {}).get("content", "")
 
-            span.set_attribute("gen_ai.usage.input_tokens", result.get("prompt_eval_count", 0))
-            span.set_attribute("gen_ai.usage.output_tokens", result.get("eval_count", 0))
-            span.set_attribute("gen_ai.response.model", OLLAMA_MODEL)
+        parsed = json.loads(output)
+        queries = parsed.get("queries", [])
 
-            parsed = json.loads(output)
-            queries = parsed.get("queries", [])
+        if isinstance(queries, list):
+            return [q for q in queries if isinstance(q, str) and q.strip()]
 
-            if isinstance(queries, list):
-                valid = [q for q in queries if isinstance(q, str) and q.strip()]
-                logfire.debug("Extracted queries", count=len(valid), queries=valid)
-                return valid
+        return []
 
-            return []
-
-        except json.JSONDecodeError as e:
-            logfire.warning("Failed to parse OLMo response as JSON", error=str(e))
-            return []
-        except Exception as e:
-            logfire.error("Query extraction failed", error=str(e))
-            return []
+    except (json.JSONDecodeError, Exception):
+        return []
 
 
 async def _search_extracted_queries(
@@ -161,31 +141,18 @@ async def _search_extracted_queries(
         )
         return results[0] if results else None
 
-    with logfire.span("recall.search_extracted", query_count=len(queries)) as span:
-        tasks = [search_one(q) for q in queries]
-        results = await asyncio.gather(*tasks)
+    tasks = [search_one(q) for q in queries]
+    results = await asyncio.gather(*tasks)
 
-        # Instrumentation
-        query_results = {
-            q: (r["id"] if r else None)
-            for q, r in zip(queries, results)
-        }
-        span.set_attribute("query_results", str(query_results))
+    # Filter None and dedupe
+    memories = []
+    seen_in_batch = set(exclude)
+    for mem in results:
+        if mem and mem["id"] not in seen_in_batch:
+            memories.append(mem)
+            seen_in_batch.add(mem["id"])
 
-        # Filter None and dedupe
-        memories = []
-        seen_in_batch = set(exclude)
-        for i, mem in enumerate(results):
-            if mem and mem["id"] not in seen_in_batch:
-                memories.append(mem)
-                seen_in_batch.add(mem["id"])
-                logfire.debug(f"Query '{queries[i]}' -> memory #{mem['id']}")
-            elif mem:
-                logfire.debug(f"Query '{queries[i]}' -> memory #{mem['id']} (deduped)")
-            else:
-                logfire.debug(f"Query '{queries[i]}' -> no result above threshold")
-
-        return memories
+    return memories
 
 
 async def recall_from(
@@ -205,53 +172,32 @@ async def recall_from(
     Returns:
         List of memory dicts with keys: id, content, created_at, score
     """
-    with logfire.span("recall_from") as span:
-        exclude_list = list(exclude) if exclude else []
-        logfire.debug("Excluded IDs", count=len(exclude_list))
+    exclude_list = list(exclude) if exclude else []
 
-        # Run direct search and query extraction in parallel
-        direct_task = cortex_search(
-            query=text,
-            limit=DIRECT_LIMIT,
-            exclude=exclude_list if exclude_list else None,
-            min_score=MIN_SCORE,
-        )
-        extract_task = _extract_queries(text)
+    # Run direct search and query extraction in parallel
+    direct_task = cortex_search(
+        query=text,
+        limit=DIRECT_LIMIT,
+        exclude=exclude_list if exclude_list else None,
+        min_score=MIN_SCORE,
+    )
+    extract_task = _extract_queries(text)
 
-        direct_memories, extracted_queries = await asyncio.gather(direct_task, extract_task)
+    direct_memories, extracted_queries = await asyncio.gather(direct_task, extract_task)
 
-        span.set_attribute("extracted_queries", extracted_queries)
-        span.set_attribute("direct_memory_ids", [m["id"] for m in direct_memories])
+    # Build exclude list for extracted searches (dedupe against direct results)
+    exclude_for_extracted = set(exclude_list)
+    for mem in direct_memories:
+        exclude_for_extracted.add(mem["id"])
 
-        # Build exclude list for extracted searches (dedupe against direct results)
-        exclude_for_extracted = set(exclude_list)
-        for mem in direct_memories:
-            exclude_for_extracted.add(mem["id"])
+    # Search extracted queries
+    extracted_memories = await _search_extracted_queries(
+        extracted_queries,
+        list(exclude_for_extracted),
+    )
 
-        # Search extracted queries
-        extracted_memories = await _search_extracted_queries(
-            extracted_queries,
-            list(exclude_for_extracted),
-        )
-
-        span.set_attribute("extracted_memory_ids", [m["id"] for m in extracted_memories])
-
-        # Merge: extracted first, then direct
-        all_memories = extracted_memories + direct_memories
-        span.set_attribute("total_memories", len(all_memories))
-
-        if not all_memories:
-            logfire.info("No memories above threshold")
-            return []
-
-        logfire.debug(
-            "Recall complete",
-            extracted=len(extracted_memories),
-            direct=len(direct_memories),
-            total=len(all_memories),
-        )
-
-        return all_memories
+    # Merge: extracted first, then direct
+    return extracted_memories + direct_memories
 
 
 async def recall(prompt: str, session_id: str) -> list[dict[str, Any]]:
@@ -268,14 +214,12 @@ async def recall(prompt: str, session_id: str) -> list[dict[str, Any]]:
     Returns:
         List of memory dicts with keys: id, content, created_at, score
     """
-    with logfire.span("recall", session_id=session_id[:8] if session_id else "none"):
-        seen = get_seen_ids(session_id)
-        seen_list = list(seen)
-        logfire.debug("Seen IDs loaded", count=len(seen_list))
+    seen = get_seen_ids(session_id)
+    seen_list = list(seen)
 
-        memories = await recall_from(prompt, exclude=seen_list if seen_list else None)
+    memories = await recall_from(prompt, exclude=seen_list if seen_list else None)
 
-        if memories:
-            mark_seen(session_id, [m["id"] for m in memories])
+    if memories:
+        mark_seen(session_id, [m["id"] for m in memories])
 
-        return memories
+    return memories
