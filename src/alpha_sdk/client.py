@@ -238,7 +238,8 @@ class AlphaClient:
         self._pending_compact: str | None = None
         # Hand-off state machine for streaming mode: None | "compacting" | "waking_up"
         self._compact_mode: str | None = None
-        self._compact_summary_parts: list[str] = []
+        self._compact_summary_parts: list[str] = []  # Dead — kept for reference
+        self._compact_user_messages: list[str] = []  # UserMessages captured during compact
         self._compact_span: logfire.LogfireSpan | None = None
 
         # Approach lights: escalating context warnings at 65% and 75%
@@ -1052,60 +1053,43 @@ class AlphaClient:
                 # ── Compact mode: suppress responses, capture summary ──
                 if self._compact_mode == "compacting":
                     if isinstance(message, AssistantMessage):
+                        # Diagnostic logging — no TextBlocks arrive during compact
                         block_types = [type(b).__name__ for b in message.content]
                         logfire.info(
                             "Compact: AssistantMessage with {blocks}",
                             blocks=block_types,
                             error=message.error,
                         )
-                        for block in message.content:
-                            if isinstance(block, TextBlock):
-                                self._compact_summary_parts.append(block.text)
-                            else:
-                                # Log non-TextBlock content for debugging
-                                logfire.info(
-                                    "Compact: non-text block {block_type}: {preview}",
-                                    block_type=type(block).__name__,
-                                    preview=str(block)[:500],
-                                )
+                    elif isinstance(message, UserMessage):
+                        # The SDK injects the compaction summary as a UserMessage.
+                        # Capture it for gen_ai.input.messages on the wake-up turn.
+                        content = message.content if isinstance(message.content, str) else ""
+                        if content:
+                            self._compact_user_messages.append(content)
+                        logfire.info(
+                            "Compact: UserMessage ({chars} chars)",
+                            chars=len(content),
+                            preview=content[:200] if content else None,
+                        )
                     elif isinstance(message, ResultMessage):
-                        # Log everything on the ResultMessage for debugging
                         logfire.info(
                             "Compact: ResultMessage (subtype={subtype}, result={result_len} chars)",
                             subtype=message.subtype,
                             result_len=len(message.result) if message.result else 0,
-                            result_preview=message.result[:500] if message.result else None,
                             is_error=message.is_error,
                             num_turns=message.num_turns,
                             session_id=message.session_id,
                         )
 
                         # Compact complete — build wake-up.
-                        # The summary may come from AssistantMessage TextBlocks
-                        # or from ResultMessage.result — try both.
-                        compact_summary = "\n".join(self._compact_summary_parts)
-                        summary_source = "text_blocks" if compact_summary else "none"
-                        if not compact_summary and message.result:
-                            compact_summary = message.result
-                            summary_source = "result"
-                        self._compact_summary_parts = []
-                        logfire.info(
-                            "Compact: summary captured ({chars} chars, source={source})",
-                            chars=len(compact_summary),
-                            source=summary_source,
-                        )
-
-                        # Build wake-up content
+                        # NOTE: The summary is already in the session as a UserMessage
+                        # (captured above). We don't need to inject it — the SDK does that.
                         self._orientation_blocks = await self._build_orientation()
                         logfire.info(
                             "Compact: orientation rebuilt ({blocks} blocks)",
                             blocks=len(self._orientation_blocks) if self._orientation_blocks else 0,
                         )
                         wake_up_blocks: list[dict[str, Any]] = []
-
-                        # Summary first — most important thing future-me reads
-                        if compact_summary:
-                            wake_up_blocks.append({"type": "text", "text": compact_summary})
 
                         # Orientation blocks
                         if self._orientation_blocks:
@@ -1165,6 +1149,8 @@ class AlphaClient:
                         self._is_context_start = True
                         # Store wake-up blocks as last content for turn span input
                         self._last_content_blocks = wake_up_blocks
+                        # Clear user content — wake-up turns have no user prompt
+                        self._last_user_content = ""
 
                         # Push turn-start for the wake-up turn
                         await self._push_event("turn-start", {})
@@ -1178,9 +1164,9 @@ class AlphaClient:
                             self._compact_span = None
 
                     else:
-                        # Log any message type we didn't expect
+                        # SystemMessages etc — diagnostic logging only
                         logfire.info(
-                            "Compact: unexpected {msg_type}",
+                            "Compact: {msg_type}",
                             msg_type=type(message).__name__,
                             preview=str(message)[:300],
                         )
@@ -1224,14 +1210,24 @@ class AlphaClient:
                                 "gen_ai.system_instructions",
                                 json.dumps([{"type": "text", "content": self._system_prompt}])
                             )
-                        # Input messages from wake-up content blocks
+                        # Input messages: SDK's compact UserMessages + our wake-up blocks
+                        input_messages = []
+                        # SDK messages (compaction summary, callback output, etc.)
+                        for um_content in self._compact_user_messages:
+                            input_messages.append({
+                                "role": "user",
+                                "parts": [{"type": "text", "content": um_content}],
+                            })
+                        self._compact_user_messages = []
+                        # Our wake-up orientation + recall + prompt
                         user_parts = []
                         for block in self._last_content_blocks:
                             if block.get("type") == "text":
                                 user_parts.append({"type": "text", "content": block["text"]})
+                        input_messages.append({"role": "user", "parts": user_parts})
                         turn_span.set_attribute(
                             "gen_ai.input.messages",
-                            json.dumps([{"role": "user", "parts": user_parts}])
+                            json.dumps(input_messages),
                         )
                         turn_span.set_attribute("gen_ai.output.messages", json.dumps([]))
 
@@ -1341,6 +1337,13 @@ class AlphaClient:
                         if hasattr(message, 'model') and message.model:
                             turn_span.set_attribute("gen_ai.response.model", message.model)
 
+                        # Tool definitions from the proxy (available after first API request)
+                        if self._compact_proxy and self._compact_proxy.last_tools:
+                            turn_span.set_attribute(
+                                "gen_ai.request.tools",
+                                json.dumps(self._compact_proxy.last_tools),
+                            )
+
                         # Close turn span BEFORE launching post-turn tasks.
                         # For wake-up turns, the span was __enter__'d in _run_session()'s
                         # context — if we create_task() while it's active, the new tasks
@@ -1429,6 +1432,7 @@ class AlphaClient:
 
                         self._compact_mode = "compacting"
                         self._compact_summary_parts = []
+                        self._compact_user_messages = []
 
                         # Tell the frontend we're compacting (keeps indicator alive)
                         await self._push_event("status", {"phase": "compacting"})

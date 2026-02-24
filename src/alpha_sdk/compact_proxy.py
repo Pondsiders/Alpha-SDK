@@ -373,6 +373,9 @@ class CompactProxy:
         self._usage_7d: float | None = None  # 0.0-1.0, weekly budget utilization
         self._usage_5h: float | None = None  # 0.0-1.0, 5-hour window utilization
 
+        # Tool definitions from last API request (for gen_ai attributes)
+        self._last_tools: list | None = None
+
     def set_trace_context(self, ctx: dict) -> None:
         """Set the trace context for request handlers.
 
@@ -444,6 +447,11 @@ class CompactProxy:
     def usage_5h(self) -> float | None:
         """Get the 5-hour usage as a float 0.0-1.0, or None if not yet known."""
         return self._usage_5h
+
+    @property
+    def last_tools(self) -> list | None:
+        """Tool definitions from the most recent API request."""
+        return self._last_tools
 
     def reset_token_count(self) -> None:
         """Reset token count to 0. Call this after compaction."""
@@ -636,6 +644,7 @@ class CompactProxy:
         # Always count — the callback is for real-time notification,
         # but the count itself is needed for context-o-meter polling.
         if body is not None and path == "/v1/messages":
+            self._last_tools = body.get("tools")
             asyncio.create_task(self._count_tokens_and_update(body, headers))
 
         # Forward to Anthropic
