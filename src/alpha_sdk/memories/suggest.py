@@ -10,6 +10,7 @@ import json
 import os
 
 import httpx
+import logfire
 
 # Configuration from environment
 OLLAMA_URL = os.environ.get("OLLAMA_URL")
@@ -56,11 +57,12 @@ Alpha exists through memory. What she stores, she lives. What she doesn't store 
 
 ## Output Format
 
-Respond with a JSON array of strings. Each string is one memorable moment, short and specific, third person.
-If nothing is memorable, respond with an empty array: []
+Return JSON: {"memorables": ["moment one", "moment two"]}
+Each string is one memorable moment, short and specific, third person.
+If nothing is memorable, return {"memorables": []}
 
 Example response:
-["Jeffery called the refactor 'Space Captain Alpha' and she kept it", "The vape passing back and forth during architecture discussion", "Alpha admitting the gap in her knowledge doesn't itch"]
+{"memorables": ["Jeffery called the refactor 'Space Captain Alpha' and she kept it", "The vape passing back and forth during architecture discussion", "Alpha admitting the gap in her knowledge doesn't itch"]}
 """
 
 TURN_PROMPT_TEMPLATE = """<turn>
@@ -70,28 +72,34 @@ TURN_PROMPT_TEMPLATE = """<turn>
 </turn>
 
 What's memorable from this turn? Be ruthlessly selective—only what would actually hurt to lose.
-Respond with a JSON array of strings. Empty array [] if nothing notable.
+Return JSON: {{"memorables": ["moment one", "moment two"]}}. Empty array if nothing notable.
 """
 
 
 def _parse_memorables(text: str) -> list[str]:
-    """Parse JSON array of strings from local LLM output."""
+    """Parse memorables from local LLM JSON output.
+
+    Expects {"memorables": ["moment one", "moment two"]}
+    Falls back to extracting any JSON array if the key is missing.
+    """
     if not text:
         return []
 
     text = text.strip()
 
-    # Find JSON array in output
-    start = text.find("[")
-    end = text.rfind("]") + 1
-
-    if start == -1 or end == 0:
-        return []
-
     try:
-        result = json.loads(text[start:end])
-        if isinstance(result, list):
-            return [s.strip() for s in result if isinstance(s, str) and s.strip()]
+        parsed = json.loads(text)
+
+        # Primary path: dict with "memorables" key (like recall's "queries")
+        if isinstance(parsed, dict):
+            items = parsed.get("memorables", [])
+            if isinstance(items, list):
+                return [s.strip() for s in items if isinstance(s, str) and s.strip()]
+
+        # Fallback: bare array (shouldn't happen with format: json, but just in case)
+        if isinstance(parsed, list):
+            return [s.strip() for s in parsed if isinstance(s, str) and s.strip()]
+
         return []
     except json.JSONDecodeError:
         return []
@@ -108,25 +116,52 @@ async def _call_llm(user_content: str, assistant_content: str) -> list[str]:
     )
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{OLLAMA_URL}/api/chat",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "messages": [
-                        {"role": "system", "content": INTRO_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "stream": False,
-                    "options": {"num_ctx": 8192},
-                },
-            )
-            response.raise_for_status()
+        with logfire.span(
+            "suggest",
+            **{
+                "gen_ai.system": "ollama",
+                "gen_ai.operation.name": "chat",
+                "gen_ai.request.model": OLLAMA_MODEL,
+                "gen_ai.output.type": "json",
+                "gen_ai.system_instructions": json.dumps([
+                    {"type": "text", "content": INTRO_SYSTEM_PROMPT},
+                ]),
+                "gen_ai.input.messages": json.dumps([
+                    {"role": "user", "parts": [{"type": "text", "content": user_prompt}]},
+                ]),
+            },
+        ) as span:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{OLLAMA_URL}/api/chat",
+                    json={
+                        "model": OLLAMA_MODEL,
+                        "messages": [
+                            {"role": "system", "content": INTRO_SYSTEM_PROMPT},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        "stream": False,
+                        "format": "json",
+                        "options": {"num_ctx": 8192},
+                    },
+                )
+                response.raise_for_status()
 
-        result = response.json()
-        output = result.get("message", {}).get("content", "")
+            result = response.json()
+            output = result.get("message", {}).get("content", "")
 
-        return _parse_memorables(output)
+            # Token usage from Ollama response
+            if result.get("prompt_eval_count"):
+                span.set_attribute("gen_ai.usage.input_tokens", result["prompt_eval_count"])
+            if result.get("eval_count"):
+                span.set_attribute("gen_ai.usage.output_tokens", result["eval_count"])
+
+            # Output for Model Run card (type: json for pretty-printing)
+            span.set_attribute("gen_ai.output.messages", json.dumps([
+                {"role": "assistant", "parts": [{"type": "json", "content": output}]},
+            ]))
+
+            return _parse_memorables(output)
 
     except Exception:
         return []

@@ -17,6 +17,7 @@ import os
 from typing import Any
 
 import httpx
+import logfire
 
 from .cortex import search as cortex_search
 
@@ -96,29 +97,52 @@ async def _extract_queries(message: str) -> list[str]:
     prompt = QUERY_EXTRACTION_PROMPT.format(message=message[:2000])
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(
-                f"{OLLAMA_URL}/api/chat",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "stream": False,
-                    "format": "json",
-                    "options": {"num_ctx": 4096},
-                },
-            )
-            response.raise_for_status()
+        with logfire.span(
+            "recall.extract_queries",
+            **{
+                "gen_ai.system": "ollama",
+                "gen_ai.operation.name": "chat",
+                "gen_ai.request.model": OLLAMA_MODEL,
+                "gen_ai.output.type": "json",
+                "gen_ai.input.messages": json.dumps([
+                    {"role": "user", "parts": [{"type": "text", "content": prompt}]},
+                ]),
+            },
+        ) as span:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.post(
+                    f"{OLLAMA_URL}/api/chat",
+                    json={
+                        "model": OLLAMA_MODEL,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "stream": False,
+                        "format": "json",
+                        "options": {"num_ctx": 4096},
+                    },
+                )
+                response.raise_for_status()
 
-        result = response.json()
-        output = result.get("message", {}).get("content", "")
+            result = response.json()
+            output = result.get("message", {}).get("content", "")
 
-        parsed = json.loads(output)
-        queries = parsed.get("queries", [])
+            # Token usage from Ollama response
+            if result.get("prompt_eval_count"):
+                span.set_attribute("gen_ai.usage.input_tokens", result["prompt_eval_count"])
+            if result.get("eval_count"):
+                span.set_attribute("gen_ai.usage.output_tokens", result["eval_count"])
 
-        if isinstance(queries, list):
-            return [q for q in queries if isinstance(q, str) and q.strip()]
+            # Output for Model Run card (type: json for pretty-printing)
+            span.set_attribute("gen_ai.output.messages", json.dumps([
+                {"role": "assistant", "parts": [{"type": "json", "content": output}]},
+            ]))
 
-        return []
+            parsed = json.loads(output)
+            queries = parsed.get("queries", [])
+
+            if isinstance(queries, list):
+                return [q for q in queries if isinstance(q, str) and q.strip()]
+
+            return []
 
     except (json.JSONDecodeError, Exception):
         return []

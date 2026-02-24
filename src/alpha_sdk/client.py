@@ -407,7 +407,7 @@ class AlphaClient:
             span_kwargs["_tags"] = ["context-start"]
 
         self._turn_span = logfire.span(
-            "alpha.turn: {prompt_preview}",
+            "turn: {prompt_preview}",
             **span_kwargs,
         )
         self._turn_span.__enter__()
@@ -777,11 +777,68 @@ class AlphaClient:
         if not self._streaming or not self._queue:
             raise RuntimeError("Streaming not active. Call connect(streaming=True).")
 
+        # Extract text for span naming
+        if isinstance(prompt, str):
+            prompt_text_for_span = prompt
+        else:
+            text_parts = [b.get("text", "") for b in prompt if b.get("type") == "text"]
+            prompt_text_for_span = " ".join(text_parts)
+        prompt_preview = prompt_text_for_span[:50].replace("\n", " ").strip()
+        if len(prompt_text_for_span) > 50:
+            prompt_preview += "…"
+
+        # Open the turn span HERE so preprocessing breadcrumbs nest under it.
+        # The span stays open across the async boundary — _run_session() will
+        # finalize and close it when ResultMessage arrives.
+        span_kwargs: dict[str, Any] = {
+            "prompt_preview": prompt_preview,
+            "session_id": self._current_session_id or "new",
+            "client_name": self.client_name,
+        }
+
+        self._turn_span = logfire.span(
+            "turn: {prompt_preview}",
+            **span_kwargs,
+        )
+        self._turn_span.__enter__()
+
+        # Set initial gen_ai attributes (will be progressively enhanced)
+        self._turn_span.set_attribute("gen_ai.system", "anthropic")
+        self._turn_span.set_attribute("gen_ai.operation.name", "chat")
+        self._turn_span.set_attribute("gen_ai.request.model", self.ALPHA_MODEL)
+        if self._current_session_id:
+            self._turn_span.set_attribute("gen_ai.conversation.id", self._current_session_id)
+        if self._system_prompt:
+            self._turn_span.set_attribute(
+                "gen_ai.system_instructions",
+                json.dumps([{"type": "text", "content": self._system_prompt}])
+            )
+
+        # Set trace context on proxy so its spans nest under this turn
+        if self._compact_proxy:
+            self._compact_proxy.set_trace_context(logfire.get_context())
+
+        # Preprocessing pipeline — breadcrumbs will nest under the turn span
         content_blocks, prompt_text = await self._build_user_content(prompt)
 
         self._last_user_content = prompt_text
         self._last_content_blocks = content_blocks
         self._turn_count += 1
+
+        # Update turn span with structured input
+        user_parts = []
+        for block in content_blocks:
+            if block.get("type") == "text":
+                user_parts.append({"type": "text", "content": block["text"]})
+        self._turn_span.set_attribute(
+            "gen_ai.input.messages",
+            json.dumps([{"role": "user", "parts": user_parts}])
+        )
+        self._turn_span.set_attribute("gen_ai.output.messages", json.dumps([]))
+
+        # Tag context-start for Logfire filtering
+        if self._is_context_start:
+            self._turn_span.set_attribute("_tags", json.dumps(["context-start"]))
 
         # Build the message in SDK streaming input format
         message = {
@@ -857,6 +914,10 @@ class AlphaClient:
             if self._orientation_blocks:
                 content_blocks.extend(self._orientation_blocks)
             self._needs_reorientation = False
+            reason = "post-compact" if self._is_context_start and self._turn_count > 0 else "new session"
+            logfire.info("Orientation: injected ({reason})", reason=reason)
+        else:
+            logfire.info("Orientation: skipped (turn {turn})", turn=self._turn_count)
 
         # Memorables nudge (from previous turn's suggest)
         if self._pending_memorables:
@@ -864,10 +925,14 @@ class AlphaClient:
             nudge += "Alpha, consider storing these from the previous turn:\n"
             nudge += "\n".join(f"- {m}" for m in self._pending_memorables)
             content_blocks.append({"type": "text", "text": nudge})
+            logfire.info("Memorables: {count} items injected", count=len(self._pending_memorables))
             self._pending_memorables = []
+        else:
+            logfire.info("Memorables: none pending")
 
         # Memory recall
         memories = await recall(prompt_text, self._current_session_id or "new")
+        images_loaded = 0
         if memories:
             for mem in memories:
                 content_blocks.append({
@@ -886,6 +951,12 @@ class AlphaClient:
                                 "data": image_data,
                             },
                         })
+                        images_loaded += 1
+        logfire.info(
+            "Recall: {count} memories{images}",
+            count=len(memories) if memories else 0,
+            images=f", {images_loaded} images" if images_loaded else "",
+        )
 
         # PSO-8601 timestamp
         sent_at = pendulum.now("America/Los_Angeles").format("ddd MMM D YYYY, h:mm A")
@@ -900,11 +971,18 @@ class AlphaClient:
         else:
             processed = await self._process_inline_images(prompt)
             content_blocks.extend(processed)
+            logfire.info("Inline images: {count} processed", count=len([b for b in processed if b.get("type") == "image"]))
 
         # Approach lights
         approach_light = self._get_approach_light()
         if approach_light:
             content_blocks.append({"type": "text", "text": approach_light})
+            pct = (self._compact_proxy.token_count / self._compact_proxy.context_window * 100) if self._compact_proxy and self._compact_proxy.context_window else 0
+            level = "red" if self._approach_warned >= 2 else "amber"
+            logfire.info("Approach lights: {level} ({pct:.0f}%)", level=level, pct=pct)
+        else:
+            pct = (self._compact_proxy.token_count / self._compact_proxy.context_window * 100) if self._compact_proxy and self._compact_proxy.context_window else 0
+            logfire.info("Approach lights: clear ({pct:.0f}%)", pct=pct)
 
         return content_blocks, prompt_text
 
@@ -1030,52 +1108,52 @@ class AlphaClient:
                     # Suppress all compact responses from SSE
                     continue
 
-                # ── Open turn span on first response of each turn ──
+                # ── Pick up turn span from send() on first response ──
                 if turn_span is None:
-                    prompt_preview = self._last_user_content[:50].replace("\n", " ").strip()
-                    if len(self._last_user_content) > 50:
-                        prompt_preview += "…"
+                    turn_span = self._turn_span  # Opened in send()
 
-                    span_kwargs: dict[str, Any] = {
-                        "prompt_preview": prompt_preview,
-                        "session_id": self._current_session_id or "new",
-                        "client_name": self.client_name,
-                    }
-                    if self._is_context_start:
-                        span_kwargs["_tags"] = ["context-start"]
+                    # For wake-up turns (post-compact), send() wasn't called —
+                    # _run_session() queued the message directly. Create span here.
+                    if turn_span is None:
+                        prompt_preview = self._last_user_content[:50].replace("\n", " ").strip()
+                        if len(self._last_user_content) > 50:
+                            prompt_preview += "…"
 
-                    turn_span = logfire.span(
-                        "alpha.turn: {prompt_preview}",
-                        **span_kwargs,
-                    )
-                    turn_span.__enter__()
+                        span_kwargs: dict[str, Any] = {
+                            "prompt_preview": prompt_preview,
+                            "session_id": self._current_session_id or "new",
+                            "client_name": self.client_name,
+                        }
+                        if self._is_context_start:
+                            span_kwargs["_tags"] = ["context-start"]
 
-                    # gen_ai attributes for Model Run card
-                    turn_span.set_attribute("gen_ai.system", "anthropic")
-                    turn_span.set_attribute("gen_ai.operation.name", "chat")
-                    turn_span.set_attribute("gen_ai.request.model", self.ALPHA_MODEL)
-                    if self._current_session_id:
-                        turn_span.set_attribute("gen_ai.conversation.id", self._current_session_id)
-                    if self._system_prompt:
-                        turn_span.set_attribute(
-                            "gen_ai.system_instructions",
-                            json.dumps([{"type": "text", "content": self._system_prompt}])
+                        turn_span = logfire.span(
+                            "turn: {prompt_preview}",
+                            **span_kwargs,
                         )
+                        turn_span.__enter__()
 
-                    # Input messages from the content blocks built in send()
-                    user_parts = []
-                    for block in self._last_content_blocks:
-                        if block.get("type") == "text":
-                            user_parts.append({"type": "text", "content": block["text"]})
-                    turn_span.set_attribute(
-                        "gen_ai.input.messages",
-                        json.dumps([{"role": "user", "parts": user_parts}])
-                    )
-                    turn_span.set_attribute("gen_ai.output.messages", json.dumps([]))
-
-                    # Proxy spans nest under this turn
-                    if self._compact_proxy:
-                        self._compact_proxy.set_trace_context(logfire.get_context())
+                        # gen_ai attributes for Model Run card
+                        turn_span.set_attribute("gen_ai.system", "anthropic")
+                        turn_span.set_attribute("gen_ai.operation.name", "chat")
+                        turn_span.set_attribute("gen_ai.request.model", self.ALPHA_MODEL)
+                        if self._current_session_id:
+                            turn_span.set_attribute("gen_ai.conversation.id", self._current_session_id)
+                        if self._system_prompt:
+                            turn_span.set_attribute(
+                                "gen_ai.system_instructions",
+                                json.dumps([{"type": "text", "content": self._system_prompt}])
+                            )
+                        # Input messages from wake-up content blocks
+                        user_parts = []
+                        for block in self._last_content_blocks:
+                            if block.get("type") == "text":
+                                user_parts.append({"type": "text", "content": block["text"]})
+                        turn_span.set_attribute(
+                            "gen_ai.input.messages",
+                            json.dumps([{"role": "user", "parts": user_parts}])
+                        )
+                        turn_span.set_attribute("gen_ai.output.messages", json.dumps([]))
 
                     # Reset per-turn accumulators
                     turn_output_parts = []
@@ -1183,8 +1261,7 @@ class AlphaClient:
                         if hasattr(message, 'model') and message.model:
                             turn_span.set_attribute("gen_ai.response.model", message.model)
 
-                        # Launch post-turn tasks BEFORE closing span so they
-                        # inherit the trace context and group under this turn
+                        # Launch post-turn tasks (fire-and-forget, run as siblings)
                         if self._last_user_content and self._last_assistant_content:
                             async def _run_suggest():
                                 try:
@@ -1195,8 +1272,8 @@ class AlphaClient:
                                     )
                                     if memorables:
                                         self._pending_memorables.extend(memorables)
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logfire.error("Suggest failed: {error}", error=str(e))
                             self._suggest_task = asyncio.create_task(_run_suggest())
 
                         if self.archive and self._last_user_content:
@@ -1210,6 +1287,7 @@ class AlphaClient:
 
                         turn_span.__exit__(None, None, None)
                         turn_span = None
+                        self._turn_span = None
                         self._is_context_start = False
 
                     # If wake-up turn just completed, clear handoff state
