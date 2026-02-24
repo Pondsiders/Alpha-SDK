@@ -239,6 +239,7 @@ class AlphaClient:
         # Hand-off state machine for streaming mode: None | "compacting" | "waking_up"
         self._compact_mode: str | None = None
         self._compact_summary_parts: list[str] = []
+        self._compact_span: logfire.LogfireSpan | None = None
 
         # Approach lights: escalating context warnings at 65% and 75%
         # Tracks the highest tier warned so we don't repeat the same warning
@@ -971,6 +972,8 @@ class AlphaClient:
             "Recall: {count} memories{images}",
             count=len(memories) if memories else 0,
             images=f", {images_loaded} images" if images_loaded else "",
+            memory_ids=[m["id"] for m in memories] if memories else [],
+            memory_scores=[round(m.get("score", 0), 3) for m in memories] if memories else [],
         )
 
         # PSO-8601 timestamp
@@ -1051,9 +1054,17 @@ class AlphaClient:
                         # Compact complete — build wake-up
                         compact_summary = "\n".join(self._compact_summary_parts)
                         self._compact_summary_parts = []
+                        logfire.info(
+                            "Compact: summary captured ({chars} chars)",
+                            chars=len(compact_summary),
+                        )
 
                         # Build wake-up content
                         self._orientation_blocks = await self._build_orientation()
+                        logfire.info(
+                            "Compact: orientation rebuilt ({blocks} blocks)",
+                            blocks=len(self._orientation_blocks) if self._orientation_blocks else 0,
+                        )
                         wake_up_blocks: list[dict[str, Any]] = []
 
                         # Summary first — most important thing future-me reads
@@ -1090,6 +1101,11 @@ class AlphaClient:
                                             },
                                         })
 
+                        logfire.info(
+                            "Compact: wake-up recall ({count} memories)",
+                            count=len(memories) if memories else 0,
+                        )
+
                         # Timestamp + wake-up prompt
                         sent_at = pendulum.now("America/Los_Angeles").format("ddd MMM D YYYY, h:mm A")
                         wake_up_blocks.append({"type": "text", "text": f"[Sent {sent_at}]"})
@@ -1119,6 +1135,11 @@ class AlphaClient:
 
                         self._compact_mode = "waking_up"
                         await self._queue.put(wake_up_message)
+
+                        # Close compact span — wake-up is queued, compaction is done
+                        if self._compact_span:
+                            self._compact_span.__exit__(None, None, None)
+                            self._compact_span = None
 
                     # Suppress all compact responses from SSE
                     continue
@@ -1337,6 +1358,16 @@ class AlphaClient:
                         compact_instructions = self._pending_compact
                         self._pending_compact = None
 
+                        # Open compact span (closed when wake-up is queued)
+                        self._compact_span = logfire.span(
+                            "compact", session_id=self._current_session_id,
+                        )
+                        self._compact_span.__enter__()
+                        logfire.info(
+                            "Compact: sending /compact ({chars} chars)",
+                            chars=len(compact_instructions),
+                        )
+
                         compact_cmd = f"/compact {compact_instructions}"
                         compact_message = {
                             "type": "user",
@@ -1361,6 +1392,10 @@ class AlphaClient:
         except Exception as e:
             await self._push_event("error", {"message": str(e)})
         finally:
+            # Clean up compact span if still open (compaction interrupted)
+            if self._compact_span is not None:
+                self._compact_span.__exit__(None, None, None)
+                self._compact_span = None
             # Clean up turn span if still open
             if turn_span is not None:
                 turn_span.__exit__(None, None, None)
