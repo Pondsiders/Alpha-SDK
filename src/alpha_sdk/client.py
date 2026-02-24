@@ -284,19 +284,30 @@ class AlphaClient:
             session_id: Session to resume, or None for new session
             streaming: If True, use streaming input mode (send/events API)
         """
-        # Start compact proxy (intercepts compact prompts + counts tokens)
-        self._compact_proxy = CompactProxy(on_token_count=self._on_token_count)
-        await self._compact_proxy.start()
-        os.environ["ANTHROPIC_BASE_URL"] = self._compact_proxy.base_url
+        with logfire.span("connect", client_name=self.client_name, streaming=streaming):
+            # Start compact proxy (intercepts compact prompts + counts tokens)
+            self._compact_proxy = CompactProxy(on_token_count=self._on_token_count)
+            await self._compact_proxy.start()
+            os.environ["ANTHROPIC_BASE_URL"] = self._compact_proxy.base_url
+            logfire.info("CompactProxy started ({url})", url=self._compact_proxy.base_url)
 
-        # Build the system prompt - just the soul
-        self._system_prompt = f"# Alpha\n\n{get_soul()}"
+            # Build the system prompt - just the soul
+            self._system_prompt = f"# Alpha\n\n{get_soul()}"
+            logfire.info("Soul loaded ({chars} chars)", chars=len(self._system_prompt))
 
-        # Pre-build orientation blocks (will be injected on first turn)
-        self._orientation_blocks = await self._build_orientation()
+            # Pre-build orientation blocks (will be injected on first turn)
+            self._orientation_blocks = await self._build_orientation()
+            logfire.info(
+                "Orientation assembled ({blocks} blocks)",
+                blocks=len(self._orientation_blocks),
+            )
 
-        # Create SDK client with system prompt
-        await self._create_sdk_client(session_id)
+            # Create SDK client with system prompt
+            await self._create_sdk_client(session_id)
+            logfire.info("SDK client created")
+
+        # Streaming setup AFTER span closes — _run_session() must not
+        # inherit connect's trace context, or turn spans become children.
         if streaming:
             self._streaming = True
             self._queue = asyncio.Queue()
@@ -316,43 +327,47 @@ class AlphaClient:
 
     async def disconnect(self) -> None:
         """Disconnect and clean up resources."""
-        # Shutdown streaming if active
-        if self._streaming:
-            if self._queue:
-                await self._queue.put(_SHUTDOWN)
-            if self._session_task:
+        with logfire.span("disconnect", client_name=self.client_name):
+            # Shutdown streaming if active
+            if self._streaming:
+                if self._queue:
+                    await self._queue.put(_SHUTDOWN)
+                if self._session_task:
+                    try:
+                        await asyncio.wait_for(self._session_task, timeout=10.0)
+                    except asyncio.TimeoutError:
+                        self._session_task.cancel()
+                    except Exception:
+                        pass
+                    self._session_task = None
+                self._queue = None
+                self._response_queue = None
+                self._streaming = False
+                logfire.info("Streaming shutdown")
+
+            # Wait for any pending suggest task
+            if self._suggest_task is not None:
                 try:
-                    await asyncio.wait_for(self._session_task, timeout=10.0)
-                except asyncio.TimeoutError:
-                    self._session_task.cancel()
+                    await self._suggest_task
                 except Exception:
                     pass
-                self._session_task = None
-            self._queue = None
-            self._response_queue = None
-            self._streaming = False
+                self._suggest_task = None
 
-        # Wait for any pending suggest task
-        if self._suggest_task is not None:
-            try:
-                await self._suggest_task
-            except Exception:
-                pass
-            self._suggest_task = None
+            # Disconnect SDK client
+            if self._sdk_client:
+                await self._sdk_client.disconnect()
+                self._sdk_client = None
+                logfire.info("SDK client disconnected")
 
-        # Disconnect SDK client
-        if self._sdk_client:
-            await self._sdk_client.disconnect()
-            self._sdk_client = None
-
-        # Stop compact proxy and restore original ANTHROPIC_BASE_URL
-        if self._compact_proxy:
-            await self._compact_proxy.stop()
-            self._compact_proxy = None
-            if _ORIGINAL_ANTHROPIC_BASE_URL:
-                os.environ["ANTHROPIC_BASE_URL"] = _ORIGINAL_ANTHROPIC_BASE_URL
-            elif "ANTHROPIC_BASE_URL" in os.environ:
-                del os.environ["ANTHROPIC_BASE_URL"]
+            # Stop compact proxy and restore original ANTHROPIC_BASE_URL
+            if self._compact_proxy:
+                await self._compact_proxy.stop()
+                self._compact_proxy = None
+                if _ORIGINAL_ANTHROPIC_BASE_URL:
+                    os.environ["ANTHROPIC_BASE_URL"] = _ORIGINAL_ANTHROPIC_BASE_URL
+                elif "ANTHROPIC_BASE_URL" in os.environ:
+                    del os.environ["ANTHROPIC_BASE_URL"]
+                logfire.info("CompactProxy stopped")
 
         self._current_session_id = None
 
