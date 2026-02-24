@@ -682,13 +682,18 @@ class AlphaClient:
                     # This is the letter past-me wrote to future-me —
                     # without it, future-me wakes up with no idea what happened.
                     compact_summary_parts: list[str] = []
+                    result_message: ResultMessage | None = None
                     async for msg in self._sdk_client.receive_response():
                         if isinstance(msg, AssistantMessage):
                             for block in msg.content:
                                 if isinstance(block, TextBlock):
                                     compact_summary_parts.append(block.text)
+                        elif isinstance(msg, ResultMessage):
+                            result_message = msg
 
                     compact_summary = "\n".join(compact_summary_parts)
+                    if not compact_summary and result_message and result_message.result:
+                        compact_summary = result_message.result
 
                     # Step 2: Build orientation for fresh context
                     self._orientation_blocks = await self._build_orientation()
@@ -1047,16 +1052,47 @@ class AlphaClient:
                 # ── Compact mode: suppress responses, capture summary ──
                 if self._compact_mode == "compacting":
                     if isinstance(message, AssistantMessage):
+                        block_types = [type(b).__name__ for b in message.content]
+                        logfire.info(
+                            "Compact: AssistantMessage with {blocks}",
+                            blocks=block_types,
+                            error=message.error,
+                        )
                         for block in message.content:
                             if isinstance(block, TextBlock):
                                 self._compact_summary_parts.append(block.text)
+                            else:
+                                # Log non-TextBlock content for debugging
+                                logfire.info(
+                                    "Compact: non-text block {block_type}: {preview}",
+                                    block_type=type(block).__name__,
+                                    preview=str(block)[:500],
+                                )
                     elif isinstance(message, ResultMessage):
-                        # Compact complete — build wake-up
+                        # Log everything on the ResultMessage for debugging
+                        logfire.info(
+                            "Compact: ResultMessage (subtype={subtype}, result={result_len} chars)",
+                            subtype=message.subtype,
+                            result_len=len(message.result) if message.result else 0,
+                            result_preview=message.result[:500] if message.result else None,
+                            is_error=message.is_error,
+                            num_turns=message.num_turns,
+                            session_id=message.session_id,
+                        )
+
+                        # Compact complete — build wake-up.
+                        # The summary may come from AssistantMessage TextBlocks
+                        # or from ResultMessage.result — try both.
                         compact_summary = "\n".join(self._compact_summary_parts)
+                        summary_source = "text_blocks" if compact_summary else "none"
+                        if not compact_summary and message.result:
+                            compact_summary = message.result
+                            summary_source = "result"
                         self._compact_summary_parts = []
                         logfire.info(
-                            "Compact: summary captured ({chars} chars)",
+                            "Compact: summary captured ({chars} chars, source={source})",
                             chars=len(compact_summary),
+                            source=summary_source,
                         )
 
                         # Build wake-up content
@@ -1140,6 +1176,14 @@ class AlphaClient:
                         if self._compact_span:
                             self._compact_span.__exit__(None, None, None)
                             self._compact_span = None
+
+                    else:
+                        # Log any message type we didn't expect
+                        logfire.info(
+                            "Compact: unexpected {msg_type}",
+                            msg_type=type(message).__name__,
+                            preview=str(message)[:300],
+                        )
 
                     # Suppress all compact responses from SSE
                     continue
@@ -1297,6 +1341,16 @@ class AlphaClient:
                         if hasattr(message, 'model') and message.model:
                             turn_span.set_attribute("gen_ai.response.model", message.model)
 
+                        # Close turn span BEFORE launching post-turn tasks.
+                        # For wake-up turns, the span was __enter__'d in _run_session()'s
+                        # context — if we create_task() while it's active, the new tasks
+                        # inherit it as parent (context leakage). Closing first ensures
+                        # suggest and archive run as root traces, not children.
+                        turn_span.__exit__(None, None, None)
+                        turn_span = None
+                        self._turn_span = None
+                        self._is_context_start = False
+
                         # Launch post-turn tasks (fire-and-forget, run as siblings)
                         if self._last_user_content and self._last_assistant_content:
                             async def _run_suggest():
@@ -1320,11 +1374,6 @@ class AlphaClient:
                                     session_id=self._current_session_id,
                                 )
                             )
-
-                        turn_span.__exit__(None, None, None)
-                        turn_span = None
-                        self._turn_span = None
-                        self._is_context_start = False
 
                     # If wake-up turn just completed, clear handoff state
                     if self._compact_mode == "waking_up":
