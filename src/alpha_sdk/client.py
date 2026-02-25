@@ -1052,35 +1052,13 @@ class AlphaClient:
             async for message in self._sdk_client.receive_messages():
                 # ── Compact mode: suppress responses, capture summary ──
                 if self._compact_mode == "compacting":
-                    if isinstance(message, AssistantMessage):
-                        # Diagnostic logging — no TextBlocks arrive during compact
-                        block_types = [type(b).__name__ for b in message.content]
-                        logfire.info(
-                            "Compact: AssistantMessage with {blocks}",
-                            blocks=block_types,
-                            error=message.error,
-                        )
-                    elif isinstance(message, UserMessage):
+                    if isinstance(message, UserMessage):
                         # The SDK injects the compaction summary as a UserMessage.
                         # Capture it for gen_ai.input.messages on the wake-up turn.
                         content = message.content if isinstance(message.content, str) else ""
                         if content:
                             self._compact_user_messages.append(content)
-                        logfire.info(
-                            "Compact: UserMessage ({chars} chars)",
-                            chars=len(content),
-                            preview=content[:200] if content else None,
-                        )
                     elif isinstance(message, ResultMessage):
-                        logfire.info(
-                            "Compact: ResultMessage (subtype={subtype}, result={result_len} chars)",
-                            subtype=message.subtype,
-                            result_len=len(message.result) if message.result else 0,
-                            is_error=message.is_error,
-                            num_turns=message.num_turns,
-                            session_id=message.session_id,
-                        )
-
                         # Compact complete — build wake-up.
                         # NOTE: The summary is already in the session as a UserMessage
                         # (captured above). We don't need to inject it — the SDK does that.
@@ -1164,12 +1142,7 @@ class AlphaClient:
                             self._compact_span = None
 
                     else:
-                        # SystemMessages etc — diagnostic logging only
-                        logfire.info(
-                            "Compact: {msg_type}",
-                            msg_type=type(message).__name__,
-                            preview=str(message)[:300],
-                        )
+                        pass  # SystemMessages during compact — no action needed
 
                     # Suppress all compact responses from SSE
                     continue
