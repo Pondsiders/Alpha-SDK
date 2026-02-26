@@ -6,6 +6,7 @@ Architecture:
 - Minimal proxy intercepts only compact prompts for rewriting
 """
 
+from .broadcast import SessionBroadcast
 from .client import AlphaClient, PermissionMode
 from .compact_proxy import CompactProxy
 from .observability import configure as configure_observability
@@ -15,6 +16,8 @@ __all__ = [
     # Main client
     "AlphaClient",
     "PermissionMode",
+    # Broadcast (fan-out SSE events to multiple subscribers)
+    "SessionBroadcast",
     # Compact proxy (for direct use if needed)
     "CompactProxy",
     # Session discovery

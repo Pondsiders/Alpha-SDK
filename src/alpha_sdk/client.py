@@ -42,6 +42,7 @@ from claude_agent_sdk.types import (
 )
 
 from .archive import archive_turn
+from .broadcast import SessionBroadcast
 from .compact_proxy import CompactProxy, TokenCountCallback
 from .memories.db import search_memories
 from .memories.embeddings import embed_query, EmbeddingError
@@ -177,9 +178,8 @@ class AlphaClient:
         # Streaming input mode state (when connect(streaming=True))
         self._streaming: bool = False
         self._queue: asyncio.Queue | None = None       # Input: messages for the generator
-        self._response_queue: asyncio.Queue | None = None  # Output: SSE events for consumers
+        self._broadcast: SessionBroadcast | None = None  # Output: fan-out to SSE subscribers
         self._session_task: asyncio.Task | None = None  # Background: _run_session()
-        self._event_counter: int = 0                    # Incrementing SSE event IDs
         self._turn_count: int = 0                       # Turns sent this session
 
     # -------------------------------------------------------------------------
@@ -237,8 +237,7 @@ class AlphaClient:
         if streaming:
             self._streaming = True
             self._queue = asyncio.Queue()
-            self._response_queue = asyncio.Queue()
-            self._event_counter = 0
+            self._broadcast = SessionBroadcast()
             self._turn_count = 0
             self._session_task = asyncio.create_task(self._run_session())
 
@@ -267,7 +266,9 @@ class AlphaClient:
                         pass
                     self._session_task = None
                 self._queue = None
-                self._response_queue = None
+                if self._broadcast:
+                    self._broadcast.close()
+                    self._broadcast = None
                 self._streaming = False
                 logfire.info("Streaming shutdown")
 
@@ -387,8 +388,15 @@ class AlphaClient:
 
         await self._queue.put(message)
 
-    async def events(self) -> AsyncGenerator[dict[str, Any], None]:
-        """Async iterator over SSE events from the response queue.
+    async def events(self, from_seq: int = 0) -> AsyncGenerator[dict[str, Any], None]:
+        """Async iterator over SSE events.
+
+        Each call creates an independent subscriber — multiple callers
+        each receive every event (fan-out, not split).
+
+        Args:
+            from_seq: Replay buffered events after this sequence number.
+                Pass Last-Event-ID from SSE spec for reconnection.
 
         Yields dicts like:
             {"type": "text-delta", "data": {"text": "Hello"}, "id": 1}
@@ -396,13 +404,17 @@ class AlphaClient:
 
         Terminates when the session ends (disconnect or error).
         """
-        if not self._response_queue:
+        if not self._broadcast:
             raise RuntimeError("Streaming not active.")
-        while True:
-            event = await self._response_queue.get()
-            if event is None:
-                return
-            yield event
+        queue = self._broadcast.subscribe(from_seq)
+        try:
+            while True:
+                event = await queue.get()
+                if event is None:
+                    return
+                yield event
+        finally:
+            self._broadcast.unsubscribe(queue)
 
     async def interrupt(self) -> None:
         """Interrupt the current SDK operation."""
@@ -936,32 +948,27 @@ class AlphaClient:
             # Clean up query task if still running
             if 'query_task' in locals() and not query_task.done():
                 query_task.cancel()
-            # Signal that events() should terminate
-            if self._response_queue:
-                await self._response_queue.put(None)
+            # Signal all subscribers to stop
+            if self._broadcast:
+                self._broadcast.close()
 
     async def _push_event(
         self,
         event_type: str | None,
         data: dict[str, Any] | None = None,
     ) -> None:
-        """Push an SSE event to the response queue.
+        """Push an SSE event to all subscribers via broadcast.
 
         Args:
-            event_type: Event type string, or None for done sentinel
+            event_type: Event type string, or None to close all subscribers
             data: Event data dict
         """
-        if self._response_queue is None:
+        if self._broadcast is None:
             return
         if event_type is None:
-            await self._response_queue.put(None)
+            self._broadcast.close()
             return
-        self._event_counter += 1
-        await self._response_queue.put({
-            "type": event_type,
-            "data": data or {},
-            "id": self._event_counter,
-        })
+        self._broadcast.publish(event_type, data or {})
 
     # -------------------------------------------------------------------------
     # Properties
