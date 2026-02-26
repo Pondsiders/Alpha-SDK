@@ -4,8 +4,16 @@
 # dependencies = [
 #     "rich>=13.0",
 #     "prompt-toolkit>=3.0",
-#     "alpha_sdk @ file:///Pondside/Basement/alpha_sdk",
+#     "alpha_sdk>=0.5,<1.0",
 # ]
+#
+# [[tool.uv.index]]
+# url = "https://pondsiders.github.io/Alpha-SDK/simple/"
+# name = "pondsiders"
+# explicit = true
+#
+# [tool.uv.sources]
+# alpha_sdk = { index = "pondsiders" }
 # ///
 """
 quack - Emergency Alpha hotline.
