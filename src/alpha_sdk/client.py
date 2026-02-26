@@ -49,8 +49,15 @@ from .memories.images import load_thumbnail_base64, process_inline_image
 from .memories.recall import recall
 from .memories.suggest import suggest
 from .memories.vision import caption_image
+from .preprocessing import (
+    build_orientation,
+    extract_prompt_text,
+    format_image_recall,
+    format_memory,
+    get_approach_light,
+    relative_time,
+)
 from .sessions import list_sessions, get_session_path, get_sessions_dir, SessionInfo
-from .system_prompt import assemble
 from .tools.cortex import create_cortex_server
 from .tools.fetch import create_fetch_server
 from .tools.forge import create_forge_server
@@ -75,87 +82,6 @@ _SDK_DISALLOWED_TOOLS = [
 _SHUTDOWN = object()
 
 
-def _message_to_dict(message: Any) -> dict:
-    """Convert an SDK message to a dict for logging.
-
-    Handles the various dataclass types from claude_agent_sdk.
-    """
-    from dataclasses import asdict, is_dataclass
-
-    if is_dataclass(message) and not isinstance(message, type):
-        try:
-            return asdict(message)
-        except Exception:
-            # Some fields might not be serializable
-            return {"type": type(message).__name__, "repr": repr(message)[:500]}
-    elif hasattr(message, "__dict__"):
-        return {"type": type(message).__name__, **message.__dict__}
-    else:
-        return {"type": type(message).__name__, "repr": repr(message)[:500]}
-
-
-def _relative_time(created_at: str) -> str:
-    """Format a created_at timestamp as human-readable relative time."""
-    try:
-        dt = pendulum.parse(created_at).in_tz("America/Los_Angeles")
-        now = pendulum.now("America/Los_Angeles")
-        diff = now.diff(dt)
-        if diff.in_days() == 0:
-            return f"today at {dt.format('h:mm A')}"
-        elif diff.in_days() == 1:
-            return f"yesterday at {dt.format('h:mm A')}"
-        elif diff.in_days() < 7:
-            return f"{diff.in_days()} days ago"
-        elif diff.in_days() < 30:
-            weeks = diff.in_days() // 7
-            return f"{weeks} week{'s' if weeks > 1 else ''} ago"
-        else:
-            return dt.format("ddd MMM D YYYY")
-    except Exception:
-        return created_at  # fallback to raw string
-
-
-def _format_memory(memory: dict) -> str:
-    """Format a memory for inclusion in user content.
-
-    Creates human-readable memory text with relative timestamps.
-    """
-    mem_id = memory.get("id", "?")
-    content = memory.get("content", "").strip()
-    score = memory.get("score")
-    relative = _relative_time(memory.get("created_at", ""))
-
-    # Include score if present (helps with debugging/transparency)
-    score_str = f", score {score:.2f}" if score is not None else ""
-    return f"## Memory #{mem_id} ({relative}{score_str})\n{content}"
-
-
-def _format_image_recall(results: list[dict[str, Any]]) -> str:
-    """Format memories for image-triggered recall.
-
-    Text-only breadcrumbs — no binary image injection.
-    This prevents recursion: images reminding of images that have images.
-    """
-    lines = ["🔍 This image reminds me of:"]
-    for item in results:
-        mem_id = item.get("id", "?")
-        metadata = item.get("metadata", {})
-        relative = _relative_time(metadata.get("created_at", ""))
-        content = item.get("content", "").strip()
-
-        # First line only, truncated for breadcrumb
-        first_line = content.split("\n")[0]
-        if len(first_line) > 120:
-            first_line = first_line[:117] + "..."
-
-        # Flag memories that have attached images
-        image_flag = " [📷 attached]" if metadata.get("image_path") else ""
-
-        lines.append(f"• Memory #{mem_id} ({relative}): {first_line}{image_flag}")
-
-    return "\n".join(lines)
-
-
 class AlphaClient:
     """Long-lived client that wraps Claude Agent SDK.
 
@@ -166,14 +92,12 @@ class AlphaClient:
     - Memorables = per-turn nudge, in user content
 
     Usage:
-        async with AlphaClient(cwd="/Pondside") as client:
-            await client.query("Hello!", session_id=None)  # New session
-            async for event in client.stream():
-                print(event)
+        client = AlphaClient(cwd="/Pondside", client_name="duckpond")
+        await client.connect(session_id=None, streaming=True)
 
-            await client.query("Continue...", session_id=client.session_id)
-            async for event in client.stream():
-                print(event)
+        await client.send("Hello!")
+        async for event in client.events():
+            print(event)  # {"type": "text-delta", "data": {"text": "Hi"}, "id": 1}
     """
 
     # The model that IS Alpha. Pinned at the SDK level, not configurable per-client.
@@ -229,12 +153,12 @@ class AlphaClient:
         self._last_assistant_content: str = ""
         self._turn_span: logfire.LogfireSpan | None = None
         self._suggest_task: asyncio.Task | None = None
-        self._pending_memorables: list[str] = []  # From last suggest, consumed on next query
+        self._pending_memorables: list[str] = []  # From last suggest, consumed on next send()
 
         # Compaction flag - set by PreCompact hook, cleared after re-orientation
         self._needs_reorientation: bool = False
 
-        # Hand-off: compact instructions set by the hand-off tool, consumed after stream
+        # Hand-off: compact instructions set by the hand-off tool, consumed after turn
         self._pending_compact: str | None = None
         # Hand-off state machine for streaming mode: None | "compacting" | "waking_up"
         self._compact_mode: str | None = None
@@ -280,7 +204,7 @@ class AlphaClient:
         """Connect to Claude.
 
         Starts the compact proxy, assembles the system prompt (soul only),
-        and creates the SDK client. Orientation will be injected on first query.
+        and creates the SDK client. Orientation will be injected on first send().
 
         Args:
             session_id: Session to resume, or None for new session
@@ -373,417 +297,9 @@ class AlphaClient:
 
         self._current_session_id = None
 
-    async def __aenter__(self) -> "AlphaClient":
-        """Context manager entry - connects the client."""
-        await self.connect()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit - disconnects the client."""
-        await self.disconnect()
-
     # -------------------------------------------------------------------------
     # Conversation
     # -------------------------------------------------------------------------
-
-    async def query(
-        self,
-        prompt: str | list[dict[str, Any]],
-        session_id: str | None = None,
-    ) -> None:
-        """Send a query to the agent.
-
-        Args:
-            prompt: The user's message - string or content blocks
-            session_id: Session to resume, or None for new session
-        """
-        # Extract text for span naming and memory operations
-        if isinstance(prompt, str):
-            prompt_text = prompt
-        else:
-            text_parts = [b.get("text", "") for b in prompt if b.get("type") == "text"]
-            prompt_text = " ".join(text_parts)
-
-        # Build span name from prompt preview (first 50 chars, single line)
-        prompt_preview = prompt_text[:50].replace("\n", " ").strip()
-        if len(prompt_text) > 50:
-            prompt_preview += "…"
-
-        # Check if we need orientation (new session or post-compact)
-        needs_orientation = (session_id is None) or self._needs_reorientation
-        self._is_context_start = needs_orientation
-
-        # Start the root turn span with prompt preview in the name
-        # Tag first turn of context window for Logfire filtering
-        span_kwargs: dict[str, Any] = {
-            "prompt_preview": prompt_preview,
-            "session_id": session_id or "new",
-            "client_name": self.client_name,
-        }
-        if self._is_context_start:
-            span_kwargs["_tags"] = ["context-start"]
-
-        self._turn_span = logfire.span(
-            "turn: {prompt_preview}",
-            **span_kwargs,
-        )
-        self._turn_span.__enter__()
-
-        # Set gen_ai attributes for Model Run card (progressively enhanced)
-        self._turn_span.set_attribute("gen_ai.system", "anthropic")
-        self._turn_span.set_attribute("gen_ai.operation.name", "chat")
-        self._turn_span.set_attribute("gen_ai.request.model", self.ALPHA_MODEL)
-        if session_id:
-            self._turn_span.set_attribute("gen_ai.conversation.id", session_id)
-
-        # System instructions = just the soul (the static system prompt)
-        if self._system_prompt:
-            self._turn_span.set_attribute(
-                "gen_ai.system_instructions",
-                json.dumps([{"type": "text", "content": self._system_prompt}])
-            )
-
-        # Initialize output messages (will be progressively updated in stream())
-        self._turn_span.set_attribute("gen_ai.input.messages", json.dumps([]))
-        self._turn_span.set_attribute("gen_ai.output.messages", json.dumps([]))
-
-        # Set trace context on proxy so its spans nest under this turn
-        if self._compact_proxy:
-            self._compact_proxy.set_trace_context(logfire.get_context())
-
-        # Handle session switching
-        await self._ensure_session(session_id)
-
-        if not self._sdk_client:
-            raise RuntimeError("Client not connected. Call connect() first.")
-
-        self._last_user_content = prompt_text
-
-        # Build content blocks
-        content_blocks: list[dict[str, Any]] = []
-
-        if needs_orientation:
-            # Re-build orientation in case it's stale (post-compact)
-            if self._needs_reorientation:
-                self._orientation_blocks = await self._build_orientation()
-                # Reset token count — compaction just shrunk the context
-                if self._compact_proxy:
-                    self._compact_proxy.reset_token_count()
-
-            # Add orientation blocks
-            if self._orientation_blocks:
-                content_blocks.extend(self._orientation_blocks)
-
-            self._needs_reorientation = False
-
-        # Check for memorables from previous turn (the nudge)
-        if self._pending_memorables:
-            nudge = "## Intro speaks\n\n"
-            nudge += "Alpha, consider storing these from the previous turn:\n"
-            nudge += "\n".join(f"- {m}" for m in self._pending_memorables)
-            content_blocks.append({"type": "text", "text": nudge})
-            self._pending_memorables = []  # Consumed
-
-        # Recall memories for this prompt
-        memories = await recall(prompt_text, self._current_session_id or "new")
-        if memories:
-            images_injected = 0
-            for mem in memories:
-                content_blocks.append({
-                    "type": "text",
-                    "text": _format_memory(mem)
-                })
-                # Mind's Eye: if memory has an attached image, inject it
-                if mem.get("image_path"):
-                    image_data = load_thumbnail_base64(mem["image_path"])
-                    if image_data:
-                        content_blocks.append({
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": image_data,
-                            },
-                        })
-                        images_injected += 1
-
-        # Add PSO-8601 timestamp right before user's prompt
-        sent_at = pendulum.now("America/Los_Angeles").format("ddd MMM D YYYY, h:mm A")
-        content_blocks.append({
-            "type": "text",
-            "text": f"[Sent {sent_at}]"
-        })
-
-        # Add the user's actual prompt, processing any inline images
-        if isinstance(prompt, str):
-            content_blocks.append({"type": "text", "text": prompt})
-        else:
-            processed_prompt = await self._process_inline_images(prompt)
-            content_blocks.extend(processed_prompt)
-
-        # Approach lights: context warnings at 65% and 75%
-        approach_light = self._get_approach_light()
-        if approach_light:
-            content_blocks.append({"type": "text", "text": approach_light})
-
-        # Store for observability (full content, not just user text)
-        self._last_content_blocks = content_blocks
-
-        # Update turn span with full structured input
-        if self._turn_span:
-            user_parts = []
-            for block in content_blocks:
-                if block.get("type") == "text":
-                    user_parts.append({"type": "text", "content": block.get("text", "")})
-            self._turn_span.set_attribute(
-                "gen_ai.input.messages",
-                json.dumps([{"role": "user", "parts": user_parts}])
-            )
-
-        # Send via transport bypass (SDK query() only takes strings)
-        message = {
-            "type": "user",
-            "message": {"role": "user", "content": content_blocks},
-            "session_id": self._current_session_id or "new",
-        }
-        await self._sdk_client._transport.write(json.dumps(message) + "\n")
-
-    async def stream(self) -> AsyncGenerator[Any, None]:
-        """Stream responses from the agent.
-
-        All response messages flow through the root alpha.turn span (created in query()).
-        Assistant text and tool calls are tracked for gen_ai.output.messages on the turn span.
-        Inference count is tracked by counting tool result cycles.
-
-        Yields:
-            Message objects from the SDK
-        """
-        if not self._sdk_client:
-            raise RuntimeError("Client not connected. Call connect() first.")
-
-        try:
-            assistant_text_parts: list[str] = []
-            turn_output_parts: list[dict] = []
-            inference_count = 0
-
-            async for message in self._sdk_client.receive_response():
-                # Handle assistant messages (text + tool calls)
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            assistant_text_parts.append(block.text)
-                            turn_output_parts.append({
-                                "type": "text",
-                                "content": block.text,
-                            })
-                        elif isinstance(block, ToolUseBlock):
-                            turn_output_parts.append({
-                                "type": "tool_call",
-                                "id": block.id,
-                                "name": block.name,
-                                "arguments": block.input,
-                            })
-
-                    # Update turn span output progressively
-                    if self._turn_span and turn_output_parts:
-                        self._turn_span.set_attribute(
-                            "gen_ai.output.messages",
-                            json.dumps([{"role": "assistant", "parts": turn_output_parts}])
-                        )
-
-                    # Capture finish reason
-                    if hasattr(message, 'stop_reason') and message.stop_reason:
-                        if self._turn_span:
-                            self._turn_span.set_attribute(
-                                "gen_ai.response.finish_reasons",
-                                json.dumps([message.stop_reason])
-                            )
-
-                # Handle user messages (tool results) — count inference cycles
-                elif isinstance(message, UserMessage):
-                    if isinstance(message.content, list):
-                        for block in message.content:
-                            if isinstance(block, ToolResultBlock):
-                                inference_count += 1
-
-                # Capture session ID and stats from result
-                if isinstance(message, ResultMessage):
-                    self._current_session_id = message.session_id
-
-                    if self._turn_span:
-                        self._turn_span.set_attribute("session_id", message.session_id)
-                        self._turn_span.set_attribute("gen_ai.conversation.id", message.session_id)
-                        self._turn_span.set_attribute("duration_ms", message.duration_ms)
-                        self._turn_span.set_attribute("inference_count", inference_count + 1)
-                        if message.total_cost_usd:
-                            self._turn_span.set_attribute("cost_usd", message.total_cost_usd)
-                        if message.usage:
-                            input_tokens = message.usage.get("input_tokens", 0)
-                            output_tokens = message.usage.get("output_tokens", 0)
-                            if input_tokens:
-                                self._turn_span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
-                            if output_tokens:
-                                self._turn_span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
-                            cache_creation = message.usage.get("cache_creation_input_tokens", 0)
-                            cache_read = message.usage.get("cache_read_input_tokens", 0)
-                            if cache_creation:
-                                self._turn_span.set_attribute("gen_ai.usage.cache_creation.input_tokens", cache_creation)
-                            if cache_read:
-                                self._turn_span.set_attribute("gen_ai.usage.cache_read.input_tokens", cache_read)
-                        if hasattr(message, 'model') and message.model:
-                            self._turn_span.set_attribute("gen_ai.response.model", message.model)
-
-                yield message
-
-            # Store accumulated text for memorables extraction
-            self._last_assistant_content = "".join(assistant_text_parts)
-
-            if self._turn_span:
-                self._turn_span.set_attribute("response_length", len(self._last_assistant_content))
-
-                # Launch suggest as background task (results land in _pending_memorables)
-                if self._last_user_content and self._last_assistant_content:
-                    async def _run_suggest():
-                        try:
-                            memorables = await suggest(
-                                self._last_user_content,
-                                self._last_assistant_content,
-                                self._current_session_id or "unknown",
-                            )
-                            if memorables:
-                                self._pending_memorables.extend(memorables)
-                        except Exception:
-                            pass
-
-                    self._suggest_task = asyncio.create_task(_run_suggest())
-
-                # Archive the turn to Scribe (fire-and-forget)
-                if self.archive and self._last_user_content:
-                    asyncio.create_task(
-                        archive_turn(
-                            user_content=self._last_user_content,
-                            assistant_content=self._last_assistant_content,
-                            session_id=self._current_session_id,
-                        )
-                    )
-
-                # ── Hand-off: fire /compact then wake up ──
-                if self._pending_compact and self._sdk_client:
-                    compact_instructions = self._pending_compact
-                    self._pending_compact = None
-
-                    # Step 1: Send /compact — consume silently
-                    compact_cmd = f"/compact {compact_instructions}"
-                    await self._sdk_client.query(
-                        compact_cmd,
-                        session_id=self._current_session_id or "new",
-                    )
-
-                    # Capture the compaction summary from the response.
-                    # This is the letter past-me wrote to future-me —
-                    # without it, future-me wakes up with no idea what happened.
-                    compact_summary_parts: list[str] = []
-                    result_message: ResultMessage | None = None
-                    async for msg in self._sdk_client.receive_response():
-                        if isinstance(msg, AssistantMessage):
-                            for block in msg.content:
-                                if isinstance(block, TextBlock):
-                                    compact_summary_parts.append(block.text)
-                        elif isinstance(msg, ResultMessage):
-                            result_message = msg
-
-                    compact_summary = "\n".join(compact_summary_parts)
-                    if not compact_summary and result_message and result_message.result:
-                        compact_summary = result_message.result
-
-                    # Step 2: Build orientation for fresh context
-                    self._orientation_blocks = await self._build_orientation()
-                    wake_up_blocks: list[dict[str, Any]] = []
-
-                    # The compaction summary goes FIRST — it's the most
-                    # important thing future-me needs to read
-                    if compact_summary:
-                        wake_up_blocks.append({
-                            "type": "text",
-                            "text": compact_summary,
-                        })
-
-                    if self._orientation_blocks:
-                        wake_up_blocks.extend(self._orientation_blocks)
-
-                    # Recall memories relevant to what we were doing
-                    wake_up_prompt = (
-                        "You've just been through a context compaction. "
-                        "Jeffery is here and listening. Orient yourself — "
-                        "read the summary above, check in, ask questions "
-                        "if anything's unclear."
-                    )
-                    memories = await recall(wake_up_prompt, self._current_session_id or "new")
-                    if memories:
-                        for mem in memories:
-                            wake_up_blocks.append({
-                                "type": "text",
-                                "text": _format_memory(mem),
-                            })
-                            if mem.get("image_path"):
-                                image_data = load_thumbnail_base64(mem["image_path"])
-                                if image_data:
-                                    wake_up_blocks.append({
-                                        "type": "image",
-                                        "source": {
-                                            "type": "base64",
-                                            "media_type": "image/jpeg",
-                                            "data": image_data,
-                                        },
-                                    })
-
-                    # Timestamp + wake-up message
-                    sent_at = pendulum.now("America/Los_Angeles").format("ddd MMM D YYYY, h:mm A")
-                    wake_up_blocks.append({"type": "text", "text": f"[Sent {sent_at}]"})
-                    wake_up_blocks.append({"type": "text", "text": wake_up_prompt})
-
-                    # Send wake-up via transport (same pattern as query())
-                    wake_up_message = {
-                        "type": "user",
-                        "message": {"role": "user", "content": wake_up_blocks},
-                        "session_id": self._current_session_id or "new",
-                    }
-                    await self._sdk_client._transport.write(
-                        json.dumps(wake_up_message) + "\n"
-                    )
-
-                    # Step 3: Yield wake-up response to consumer
-                    async for message in self._sdk_client.receive_response():
-                        if isinstance(message, ResultMessage):
-                            if message.session_id:
-                                self._current_session_id = message.session_id
-                        yield message
-
-                    self._needs_reorientation = False  # We just oriented
-                    if self._compact_proxy:
-                        self._compact_proxy.reset_token_count()
-
-        finally:
-            # End the root turn span
-            if self._turn_span:
-                self._turn_span.__exit__(None, None, None)
-                self._turn_span = None
-
-    # -------------------------------------------------------------------------
-    # Streaming Input
-    # -------------------------------------------------------------------------
-    #
-    # Alternative to query()/stream() for long-lived sessions.
-    # Uses an async generator to feed messages to the SDK, with responses
-    # routed to a queue as SSE-ready events.
-    #
-    # Usage:
-    #     client = AlphaClient(...)
-    #     await client.connect(session_id=None, streaming=True)
-    #     await client.send("Hello!")
-    #     async for event in client.events():
-    #         print(event)  # {"type": "text-delta", "data": {"text": "Hi"}, "id": 1}
-    #
 
     async def send(
         self,
@@ -791,7 +307,7 @@ class AlphaClient:
     ) -> None:
         """Preprocess and queue a message for streaming input.
 
-        Like query(), but pushes to the input queue instead of the transport.
+        Preprocesses and pushes to the input queue.
         Returns immediately — responses flow through events().
 
         Requires connect(streaming=True) to have been called first.
@@ -800,11 +316,7 @@ class AlphaClient:
             raise RuntimeError("Streaming not active. Call connect(streaming=True).")
 
         # Extract text for span naming
-        if isinstance(prompt, str):
-            prompt_text_for_span = prompt
-        else:
-            text_parts = [b.get("text", "") for b in prompt if b.get("type") == "text"]
-            prompt_text_for_span = " ".join(text_parts)
+        prompt_text_for_span = extract_prompt_text(prompt)
         prompt_preview = prompt_text_for_span[:50].replace("\n", " ").strip()
         if len(prompt_text_for_span) > 50:
             prompt_preview += "…"
@@ -914,11 +426,7 @@ class AlphaClient:
         Returns (content_blocks, prompt_text).
         """
         # Extract text for memory operations and logging
-        if isinstance(prompt, str):
-            prompt_text = prompt
-        else:
-            text_parts = [b.get("text", "") for b in prompt if b.get("type") == "text"]
-            prompt_text = " ".join(text_parts)
+        prompt_text = extract_prompt_text(prompt)
 
         content_blocks: list[dict[str, Any]] = []
 
@@ -959,7 +467,7 @@ class AlphaClient:
             for mem in memories:
                 content_blocks.append({
                     "type": "text",
-                    "text": _format_memory(mem),
+                    "text": format_memory(mem),
                 })
                 # Mind's Eye: inject attached images
                 if mem.get("image_path"):
@@ -1085,7 +593,7 @@ class AlphaClient:
                             for mem in memories:
                                 wake_up_blocks.append({
                                     "type": "text",
-                                    "text": _format_memory(mem),
+                                    "text": format_memory(mem),
                                 })
                                 if mem.get("image_path"):
                                     image_data = load_thumbnail_base64(mem["image_path"])
@@ -1484,47 +992,16 @@ class AlphaClient:
         return CompactProxy.DEFAULT_CONTEXT_WINDOW
 
     def _get_approach_light(self) -> str | None:
-        """Check context usage and return an approach light warning if threshold crossed.
-
-        Two tiers:
-        - Amber (65%): gentle heads-up to start thinking about pausing
-        - Red (75%): stern warning to wrap up or hand off
-
-        Only fires once per tier (resets after compaction).
-        Returns the warning text, or None if no warning needed.
-        """
+        """Check context usage and return approach light warning if threshold crossed."""
         if not self._compact_proxy:
             return None
-
-        token_count = self._compact_proxy.token_count
-        context_window = self._compact_proxy.context_window
-        if context_window == 0 or token_count == 0:
-            return None
-
-        pct = token_count / context_window
-
-        if pct >= 0.75 and self._approach_warned < 2:
-            self._approach_warned = 2
-            return (
-                f"## ⚠️ Context Warning — RED ({pct:.0%})\n\n"
-                f"You're at {token_count:,} of {context_window:,} tokens. "
-                "This is not a drill. Wrap up what you're doing and either hand off "
-                "(use the hand-off tool with instructions for next-you) or let Jeffery know "
-                "it's time to compact. Starting new topics now is risky — you may lose context "
-                "before you can finish them."
-            )
-
-        if pct >= 0.65 and self._approach_warned < 1:
-            self._approach_warned = 1
-            return (
-                f"## 🟡 Context Warning — AMBER ({pct:.0%})\n\n"
-                f"You're at {token_count:,} of {context_window:,} tokens. "
-                "Start thinking about a good place to pause. You don't need to stop immediately, "
-                "but keep an eye on where the conversation is heading. If there's something important "
-                "to store or hand off, now's a good time to start thinking about it."
-            )
-
-        return None
+        text, new_level = get_approach_light(
+            self._compact_proxy.token_count,
+            self._compact_proxy.context_window,
+            self._approach_warned,
+        )
+        self._approach_warned = new_level
+        return text
 
     @property
     def usage_7d(self) -> float | None:
@@ -1676,7 +1153,7 @@ class AlphaClient:
                 return None
 
             # Format as text-only breadcrumbs (no image injection)
-            return _format_image_recall(results)
+            return format_image_recall(results)
 
         except EmbeddingError:
             return None
@@ -1688,32 +1165,8 @@ class AlphaClient:
     # -------------------------------------------------------------------------
 
     async def _build_orientation(self) -> list[dict[str, Any]]:
-        """Build orientation blocks for session start.
-
-        This includes everything except the soul (which is in system prompt):
-        - Capsules (yesterday, last night)
-        - Letter from last night
-        - Today so far
-        - Here (client, machine, weather)
-        - ALPHA.md context files
-        - Events
-        - Todos
-        """
-        # Use the existing assemble() but we'll extract just the non-soul parts
-        all_blocks = await assemble(
-            client=self.client_name,
-            hostname=self.hostname,
-        )
-
-        # Skip the first block (which is the soul)
-        # The soul starts with "# Alpha\n\n"
-        orientation_blocks = []
-        for block in all_blocks:
-            text = block.get("text", "")
-            if not text.startswith("# Alpha\n\n"):
-                orientation_blocks.append(block)
-
-        return orientation_blocks
+        """Build orientation blocks for session start."""
+        return await build_orientation(self.client_name, self.hostname)
 
     async def _on_pre_compact(
         self,
@@ -1725,21 +1178,6 @@ class AlphaClient:
         self._needs_reorientation = True
         self._approach_warned = 0  # Reset approach lights after compaction
         return {"continue_": True}
-
-    async def _ensure_session(self, session_id: str | None) -> None:
-        """Ensure we have the right SDK client for the requested session."""
-        needs_new_client = False
-
-        if session_id is None:
-            # New session requested
-            if self._current_session_id is not None:
-                needs_new_client = True
-        elif session_id != self._current_session_id:
-            # Different session requested
-            needs_new_client = True
-
-        if needs_new_client:
-            await self._create_sdk_client(session_id)
 
     async def _create_sdk_client(self, session_id: str | None = None) -> None:
         """Create or recreate the SDK client."""
