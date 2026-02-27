@@ -345,6 +345,15 @@ class TestEngineConfig:
         assert engine.mcp_config == "/path/to/config.json"
         assert engine.permission_mode == "default"
 
+    def test_extra_args_default_empty(self):
+        engine = Engine()
+        assert engine.extra_args == []
+
+    def test_extra_args_stored(self):
+        args = ["--tools", "", "--disable-slash-commands", "--no-chrome"]
+        engine = Engine(extra_args=args)
+        assert engine.extra_args == args
+
 
 # -- AssistantEvent text property ---------------------------------------------
 

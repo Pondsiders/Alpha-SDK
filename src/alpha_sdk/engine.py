@@ -136,11 +136,13 @@ class Engine:
         system_prompt: str | None = None,
         mcp_config: str | None = None,
         permission_mode: str = "bypassPermissions",
+        extra_args: list[str] | None = None,
     ):
         self.model = model
         self.system_prompt = system_prompt
         self.mcp_config = mcp_config
         self.permission_mode = permission_mode
+        self.extra_args = extra_args or []
 
         self._state = EngineState.IDLE
         self._proc: asyncio.subprocess.Process | None = None
@@ -332,11 +334,19 @@ class Engine:
         if self.mcp_config:
             cmd.extend(["--mcp-config", self.mcp_config])
 
+        if self.extra_args:
+            cmd.extend(self.extra_args)
+
+        # Clear CLAUDECODE env var so we can spawn claude from within
+        # another claude process (SDK running inside Claude Code, tests, etc.)
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
         return await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
 
     async def _init_handshake(self) -> InitEvent:
