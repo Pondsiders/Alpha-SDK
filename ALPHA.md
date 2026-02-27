@@ -17,7 +17,7 @@ Alpha SDK v1.x wraps the Claude Agent SDK. It works — Duckpond, Solitude, and 
 - **Frobozz is impossible.** The sub-loop where game output becomes synthetic user messages requires input queue control the Agent SDK doesn't expose.
 - **Multiple engines** (primary + sidecar) need different lifecycles the SDK doesn't think in terms of.
 
-The Agent SDK got us here. To go further, we need to own the inference layer.
+The Agent SDK got us here. To go further, we need to talk to `claude` directly.
 
 ## What We Proved (Feb 26, 2026)
 
@@ -66,7 +66,7 @@ src/alpha_sdk/
 │   ├── cortex.py          # store, search, recent (high-level API)
 │   ├── embeddings.py      # Embedding generation
 │   ├── recall.py          # Smart recall (via sidecar or Ollama)
-│   └── suggest.py         # Intro — memorables extraction (via sidecar or Ollama)
+│   └── suggest.py         # Memorables extraction (via sidecar or Ollama)
 │
 ├── system_prompt/         # Static identity (one per session)
 │   ├── assemble.py        # Builds system prompt: soul + bill of rights
@@ -201,6 +201,8 @@ Same as v1.x: Pondsiders package index on GitHub Pages, semver, `uv` everywhere.
 ## Status
 
 **In progress.** Branch `sdk-next`, baseline commit `4971b37`. The room is empty. The chalkboard is clean.
+
+Granular progress tracking lives in [#22](https://github.com/Pondsiders/Alpha-SDK/issues/22). This doc is the reference architecture; the issue is the punch list.
 
 ## Decision Log
 
