@@ -17,6 +17,7 @@ from alpha_sdk.engine import (
     ErrorEvent,
     _ControlRequestEvent,
 )
+from alpha_sdk.proxy import CompactConfig
 
 
 # -- Event Parsing -----------------------------------------------------------
@@ -353,6 +354,43 @@ class TestEngineConfig:
         args = ["--tools", "", "--disable-slash-commands", "--no-chrome"]
         engine = Engine(extra_args=args)
         assert engine.extra_args == args
+
+    def test_compact_config_default_none(self):
+        engine = Engine()
+        assert engine.compact_config is None
+
+    def test_compact_config_stored(self):
+        config = CompactConfig(system="s", prompt="p", continuation="c")
+        engine = Engine(compact_config=config)
+        assert engine.compact_config is config
+
+
+# -- Proxy property defaults (before start) -----------------------------------
+
+
+class TestProxyPropertyDefaults:
+    """Proxy properties return safe defaults when no proxy is running."""
+
+    def test_token_count_default(self):
+        engine = Engine()
+        assert engine.token_count == 0
+
+    def test_context_window_default(self):
+        engine = Engine()
+        assert engine.context_window == 200_000
+
+    def test_usage_7d_default(self):
+        engine = Engine()
+        assert engine.usage_7d is None
+
+    def test_usage_5h_default(self):
+        engine = Engine()
+        assert engine.usage_5h is None
+
+    def test_reset_token_count_no_proxy(self):
+        """reset_token_count is a no-op when no proxy exists."""
+        engine = Engine()
+        engine.reset_token_count()  # Should not raise
 
 
 # -- AssistantEvent text property ---------------------------------------------

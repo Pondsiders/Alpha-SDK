@@ -37,7 +37,8 @@ The init handshake is a capabilities advertisement (tools, MCP servers, model, c
 src/alpha_sdk/
 ├── client.py              # AlphaClient — thin. Composes session from parts.
 ├── session.py             # Session — duplex channel. send(), events()
-├── engine.py              # The claude subprocess. stdin/stdout JSON streams.
+├── engine.py              # The claude subprocess. stdin/stdout/stderr + HTTP proxy.
+├── proxy.py               # HTTP channel. Compact rewriting + token counting. Engine-private.
 ├── context.py             # Turn assembly. Orientation + recall + message → JSON.
 ├── router.py              # Output event routing. Reads engine, yields to consumers.
 ├── queue.py               # Input queue. Multiple producers, one consumer.
@@ -160,6 +161,23 @@ Based on quack-wire.py observations (Feb 26):
 - **Tools:** Execute inside claude. We see results, not execution.
 - **MCP:** Config passable at spawn time. Servers start with the process.
 
+### The Four I/O Channels
+
+The claude subprocess has four communication channels:
+
+1. **stdin** — JSON messages in (user messages, init handshake, permission responses)
+2. **stdout** — JSON events out (assistant messages, results, system events)
+3. **stderr** — Diagnostic output (drained in background, not parsed)
+4. **HTTP to Anthropic** — API requests via `ANTHROPIC_BASE_URL` (inference, compaction)
+
+The Engine manages all four. Channels 1-3 are direct subprocess pipes. Channel 4 is intercepted by a localhost HTTP proxy (`proxy.py`) that the Engine starts before spawning claude. The proxy:
+
+- **Rewrites compact requests** — Replaces claude's default summarizer identity, compact instructions, and continuation instruction with Alpha's versions. Three-phase surgical rewrite.
+- **Counts tokens** — Fire-and-forget echo to `/v1/messages/count_tokens` on every API request. Tracks high-water mark.
+- **Sniffs usage headers** — Extracts `anthropic-ratelimit-unified-{7d,5h}-utilization` from Anthropic's response headers.
+
+The proxy is a private implementation detail of Engine — no other module imports or knows about it.
+
 ## What Carries Forward from v1.x
 
 These modules port with minimal changes:
@@ -171,7 +189,7 @@ These modules port with minimal changes:
 
 These are replaced:
 - `client.py` (1,236 lines) → `client.py` + `session.py` + `engine.py` + `queue.py` + `router.py`
-- `compact_proxy.py` → TBD (may not need proxy if we own the request path)
+- `compact_proxy.py` → `proxy.py` (Engine-private. Compact rewriting + token counting + usage headers.)
 - `sessions.py` → simplified (claude manages its own sessions)
 - `observability.py` → Logfire, possibly reimagined
 
@@ -215,3 +233,4 @@ Granular progress tracking lives in [#22](https://github.com/Pondsiders/Alpha-SD
 | Feb 27, 2026 | Push > pull for memory/context | Alpha doesn't notice absence; recall IS metacognition |
 | Feb 27, 2026 | System prompt vs orientation prompt terminology | System prompt = identity (per session). Orientation = context (per context window). HUD is dead. |
 | Feb 27, 2026 | No Redis cache for orientation data | Fetch fresh from APIs each context window. Simpler than Pulse/Redis refresh cycle. |
+| Feb 27, 2026 | HTTP proxy is Engine-private (Phase 1.5) | Fourth I/O channel (compact rewrite + token counting). No independent lifecycle — born/dies with subprocess. |

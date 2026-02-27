@@ -1,8 +1,14 @@
-"""engine.py — The claude subprocess. stdin/stdout JSON streams.
+"""engine.py — The claude subprocess. All four I/O channels.
 
 Based on the protocol observed in quack-raw.py and quack-wire.py
 (Feb 26, 2026). The claude binary communicates via newline-delimited
-JSON on stdin/stdout.
+JSON on stdin/stdout, and makes API requests via ANTHROPIC_BASE_URL.
+
+The Engine manages all four channels:
+  1. stdin  — JSON messages in
+  2. stdout — JSON events out
+  3. stderr — diagnostic output (drained in background)
+  4. HTTP   — API requests (intercepted by proxy for compact rewriting)
 
 Usage:
     engine = Engine(model="claude-sonnet-4-20250514")
@@ -24,6 +30,8 @@ import os
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import AsyncIterator
+
+from .proxy import CompactConfig, _Proxy
 
 
 # -- State machine ------------------------------------------------------------
@@ -118,13 +126,12 @@ class _ControlRequestEvent(Event):
 
 
 class Engine:
-    """Manages a claude subprocess over JSON stdio.
+    """Manages a claude subprocess over JSON stdio + HTTP proxy.
 
-    The engine handles:
-    - Subprocess lifecycle (spawn, shutdown, crash recovery)
-    - The init handshake (capabilities advertisement)
-    - Message framing (JSON serialization over stdin/stdout)
-    - Permission auto-approval (control_request → control_response)
+    The engine handles all four I/O channels:
+    - stdin/stdout: JSON message framing
+    - stderr: background drain
+    - HTTP: localhost proxy for compact rewriting + token counting
 
     The engine does NOT interpret events — that's the router's job.
     It yields parsed Event objects and lets consumers decide what to do.
@@ -137,16 +144,19 @@ class Engine:
         mcp_config: str | None = None,
         permission_mode: str = "bypassPermissions",
         extra_args: list[str] | None = None,
+        compact_config: CompactConfig | None = None,
     ):
         self.model = model
         self.system_prompt = system_prompt
         self.mcp_config = mcp_config
         self.permission_mode = permission_mode
         self.extra_args = extra_args or []
+        self.compact_config = compact_config
 
         self._state = EngineState.IDLE
         self._proc: asyncio.subprocess.Process | None = None
         self._stderr_task: asyncio.Task | None = None
+        self._proxy: _Proxy | None = None
 
     @property
     def state(self) -> EngineState:
@@ -155,6 +165,33 @@ class Engine:
     @property
     def pid(self) -> int | None:
         return self._proc.pid if self._proc else None
+
+    # -- Proxy properties (delegates to _proxy) -------------------------------
+
+    @property
+    def token_count(self) -> int:
+        """Current token count from the HTTP proxy. 0 if no proxy."""
+        return self._proxy.token_count if self._proxy else 0
+
+    @property
+    def context_window(self) -> int:
+        """Context window size. Default if no proxy."""
+        return self._proxy.context_window if self._proxy else _Proxy.DEFAULT_CONTEXT_WINDOW
+
+    @property
+    def usage_7d(self) -> float | None:
+        """7-day usage quota (0.0-1.0) from Anthropic response headers."""
+        return self._proxy.usage_7d if self._proxy else None
+
+    @property
+    def usage_5h(self) -> float | None:
+        """5-hour usage quota (0.0-1.0) from Anthropic response headers."""
+        return self._proxy.usage_5h if self._proxy else None
+
+    def reset_token_count(self) -> None:
+        """Reset token count to 0. Call after compaction."""
+        if self._proxy:
+            self._proxy.reset_token_count()
 
     # -- Lifecycle ------------------------------------------------------------
 
@@ -171,6 +208,11 @@ class Engine:
         self._state = EngineState.STARTING
 
         try:
+            # Start the HTTP proxy BEFORE spawning claude so
+            # ANTHROPIC_BASE_URL is set when the subprocess starts.
+            self._proxy = _Proxy(compact_config=self.compact_config)
+            await self._proxy.start()
+
             self._proc = await self._spawn()
             self._stderr_task = asyncio.create_task(self._drain_stderr())
             init_event = await self._init_handshake()
@@ -337,9 +379,12 @@ class Engine:
         if self.extra_args:
             cmd.extend(self.extra_args)
 
-        # Clear CLAUDECODE env var so we can spawn claude from within
-        # another claude process (SDK running inside Claude Code, tests, etc.)
+        # Clean env for subprocess:
+        # - Clear CLAUDECODE so we can spawn from within another claude process
+        # - Set ANTHROPIC_BASE_URL to route API requests through our proxy
         env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        if self._proxy and self._proxy.port:
+            env["ANTHROPIC_BASE_URL"] = self._proxy.base_url
 
         return await asyncio.create_subprocess_exec(
             *cmd,
@@ -401,7 +446,7 @@ class Engine:
                 break
 
     async def _cleanup(self) -> None:
-        """Clean up the subprocess and background tasks."""
+        """Clean up the subprocess, background tasks, and proxy."""
         if self._proc:
             if self._proc.stdin and not self._proc.stdin.is_closing():
                 self._proc.stdin.close()
@@ -417,3 +462,7 @@ class Engine:
                 await self._stderr_task
             except asyncio.CancelledError:
                 pass
+
+        if self._proxy:
+            await self._proxy.stop()
+            self._proxy = None
