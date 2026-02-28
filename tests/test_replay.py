@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from alpha_sdk.engine import AssistantEvent, ResultEvent
+from alpha_sdk.engine import AssistantEvent, ResultEvent, UserEvent
 from alpha_sdk.replay import _read_jsonl, find_session_path, replay_session
 
 
@@ -71,6 +71,79 @@ def tmp_session(tmp_path) -> Path:
 
 
 @pytest.fixture
+def image_session(tmp_path) -> Path:
+    """Create a JSONL session with image content."""
+    session_id = "image-session-xyz789"
+    path = tmp_path / f"{session_id}.jsonl"
+    records = [
+        # User message with text + image
+        {
+            "type": "user",
+            "sessionId": session_id,
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What's in this image?"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "iVBORw0KGgoAAAANSUhEUg==",
+                        },
+                    },
+                ],
+            },
+        },
+        # Assistant response with thinking + text
+        {
+            "type": "assistant",
+            "sessionId": session_id,
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "Let me look at this..."},
+                    {"type": "text", "text": "I see a duck!"},
+                ],
+            },
+        },
+    ]
+    with open(path, "w") as f:
+        for record in records:
+            f.write(json.dumps(record) + "\n")
+    return path
+
+
+@pytest.fixture
+def string_content_session(tmp_path) -> Path:
+    """Create a JSONL session where user content is a plain string."""
+    session_id = "string-content-session"
+    path = tmp_path / f"{session_id}.jsonl"
+    records = [
+        {
+            "type": "user",
+            "sessionId": session_id,
+            "message": {
+                "role": "user",
+                "content": "Just a plain string",
+            },
+        },
+        {
+            "type": "assistant",
+            "sessionId": session_id,
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Got it."}],
+            },
+        },
+    ]
+    with open(path, "w") as f:
+        for record in records:
+            f.write(json.dumps(record) + "\n")
+    return path
+
+
+@pytest.fixture
 def empty_session(tmp_path) -> Path:
     """Create an empty JSONL session file."""
     path = tmp_path / "empty-session.jsonl"
@@ -119,24 +192,27 @@ class TestReadJsonl:
 
 class TestReplaySession:
     @pytest.mark.asyncio
-    async def test_yields_assistant_events(self, tmp_session):
+    async def test_yields_all_events(self, tmp_session):
         events = []
         async for event in replay_session(tmp_session):
             events.append(event)
 
-        # 2 assistant messages → 2 AssistantEvents + 2 ResultEvents
-        assert len(events) == 4
+        # 2 user + 2 assistant + 2 result = 6
+        assert len(events) == 6
 
     @pytest.mark.asyncio
-    async def test_event_types_alternate(self, tmp_session):
+    async def test_event_sequence(self, tmp_session):
+        """Events follow conversation order: user, assistant, result per turn."""
         events = []
         async for event in replay_session(tmp_session):
             events.append(event)
 
-        assert isinstance(events[0], AssistantEvent)
-        assert isinstance(events[1], ResultEvent)
-        assert isinstance(events[2], AssistantEvent)
-        assert isinstance(events[3], ResultEvent)
+        assert isinstance(events[0], UserEvent)
+        assert isinstance(events[1], AssistantEvent)
+        assert isinstance(events[2], ResultEvent)
+        assert isinstance(events[3], UserEvent)
+        assert isinstance(events[4], AssistantEvent)
+        assert isinstance(events[5], ResultEvent)
 
     @pytest.mark.asyncio
     async def test_all_events_are_replay(self, tmp_session):
@@ -144,16 +220,24 @@ class TestReplaySession:
             assert event.is_replay is True
 
     @pytest.mark.asyncio
-    async def test_content_is_preserved(self, tmp_session):
-        events = []
+    async def test_user_content_preserved(self, tmp_session):
+        users = []
+        async for event in replay_session(tmp_session):
+            if isinstance(event, UserEvent):
+                users.append(event)
+
+        assert users[0].text == "Hello!"
+        assert users[1].text == "How are you?"
+
+    @pytest.mark.asyncio
+    async def test_assistant_content_preserved(self, tmp_session):
+        assistants = []
         async for event in replay_session(tmp_session):
             if isinstance(event, AssistantEvent):
-                events.append(event)
+                assistants.append(event)
 
-        # First assistant message
-        assert events[0].text == "Hi there!"
-        # Second assistant message (two text blocks)
-        assert events[1].text == "I'm doing well! Thanks for asking."
+        assert assistants[0].text == "Hi there!"
+        assert assistants[1].text == "I'm doing well! Thanks for asking."
 
     @pytest.mark.asyncio
     async def test_result_events_have_session_id(self, tmp_session):
@@ -189,7 +273,15 @@ class TestReplaySession:
             events.append(event)
 
         # 2 valid assistant messages → 2 AssistantEvents + 2 ResultEvents
+        # (no user messages in the malformed fixture)
         assert len(events) == 4
+
+    @pytest.mark.asyncio
+    async def test_raw_preserved_on_events(self, tmp_session):
+        async for event in replay_session(tmp_session):
+            if isinstance(event, UserEvent):
+                assert event.raw.get("type") == "user"
+                break
 
     @pytest.mark.asyncio
     async def test_raw_preserved_on_assistant_events(self, tmp_session):
@@ -198,11 +290,51 @@ class TestReplaySession:
                 assert event.raw.get("type") == "assistant"
                 break
 
+    # -- Image content ---
+
     @pytest.mark.asyncio
-    async def test_user_messages_not_yielded(self, tmp_session):
-        """User messages are context, not events — they shouldn't be yielded."""
-        async for event in replay_session(tmp_session):
-            assert isinstance(event, (AssistantEvent, ResultEvent))
+    async def test_image_content_preserved(self, image_session):
+        users = []
+        async for event in replay_session(image_session):
+            if isinstance(event, UserEvent):
+                users.append(event)
+
+        assert len(users) == 1
+        content = users[0].content
+        assert len(content) == 2
+        assert content[0]["type"] == "text"
+        assert content[0]["text"] == "What's in this image?"
+        assert content[1]["type"] == "image"
+        assert content[1]["source"]["media_type"] == "image/png"
+
+    @pytest.mark.asyncio
+    async def test_image_user_text_property(self, image_session):
+        """UserEvent.text extracts only text blocks, ignoring images."""
+        async for event in replay_session(image_session):
+            if isinstance(event, UserEvent):
+                assert event.text == "What's in this image?"
+                break
+
+    @pytest.mark.asyncio
+    async def test_thinking_in_assistant_content(self, image_session):
+        """Thinking blocks are preserved in assistant content."""
+        async for event in replay_session(image_session):
+            if isinstance(event, AssistantEvent):
+                assert any(b.get("type") == "thinking" for b in event.content)
+                assert event.text == "I see a duck!"
+                break
+
+    # -- String content normalization ---
+
+    @pytest.mark.asyncio
+    async def test_string_content_normalized(self, string_content_session):
+        """Plain string user content is normalized to content blocks."""
+        async for event in replay_session(string_content_session):
+            if isinstance(event, UserEvent):
+                assert isinstance(event.content, list)
+                assert event.content[0]["type"] == "text"
+                assert event.text == "Just a plain string"
+                break
 
 
 # -- find_session_path -------------------------------------------------------

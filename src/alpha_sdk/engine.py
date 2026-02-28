@@ -102,6 +102,28 @@ class InitEvent(Event):
 
 
 @dataclass
+class UserEvent(Event):
+    """User message — content blocks from the user.
+
+    Content blocks follow the Messages API format:
+    [{"type": "text", "text": "..."}, {"type": "image", "source": {...}}, ...]
+
+    Only emitted during replay. Live user messages are sent, not received.
+    """
+
+    content: list = field(default_factory=list)
+
+    @property
+    def text(self) -> str:
+        """Extract concatenated text from content blocks."""
+        return "".join(
+            block.get("text", "")
+            for block in self.content
+            if block.get("type") == "text"
+        )
+
+
+@dataclass
 class AssistantEvent(Event):
     """Assistant response — contains content blocks.
 

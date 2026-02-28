@@ -11,13 +11,12 @@ flag lets consumers distinguish if they want to (batch-render history,
 skip animation) but they don't have to.
 
 JSONL format (observed from claude's session files):
-  - type: "user" + message.role: "user"    → user input (not replayed as events)
-  - type: "assistant" + message             → assistant response → AssistantEvent
-  - type: "queue-operation"                 → internal bookkeeping, skipped
+  - type: "user" + message.content          → UserEvent
+  - type: "assistant" + message.content      → AssistantEvent + ResultEvent
+  - type: "queue-operation"                  → internal bookkeeping, skipped
 
-Each assistant message in the transcript becomes an AssistantEvent followed
-by a synthetic ResultEvent (marking end of that turn). This matches the
-live event stream's shape: content, then result.
+Each turn produces: UserEvent, then AssistantEvent, then ResultEvent.
+This matches the shape a consumer sees during live conversation.
 """
 
 from __future__ import annotations
@@ -26,21 +25,23 @@ import json
 from pathlib import Path
 from typing import AsyncIterator
 
-from .engine import AssistantEvent, ResultEvent
+from .engine import AssistantEvent, ResultEvent, UserEvent
 
 
-async def replay_session(path: Path) -> AsyncIterator[AssistantEvent | ResultEvent]:
+async def replay_session(
+    path: Path,
+) -> AsyncIterator[UserEvent | AssistantEvent | ResultEvent]:
     """Read a JSONL session file and yield replay events.
 
-    Yields AssistantEvent + ResultEvent pairs for each assistant turn
-    in the transcript. All events have is_replay=True.
+    Yields the full conversation: UserEvent for each user message,
+    AssistantEvent + ResultEvent for each assistant turn.
+    All events have is_replay=True.
 
     Args:
         path: Path to the JSONL session file.
 
     Yields:
-        AssistantEvent for each assistant message, followed by
-        ResultEvent marking end of that turn.
+        UserEvent, AssistantEvent, ResultEvent — in conversation order.
     """
     session_id = path.stem  # UUID is the filename
 
@@ -48,7 +49,21 @@ async def replay_session(path: Path) -> AsyncIterator[AssistantEvent | ResultEve
     for record in _read_jsonl(path):
         record_type = record.get("type", "")
 
-        if record_type == "assistant":
+        if record_type == "user":
+            message = record.get("message", {})
+            content = message.get("content", [])
+
+            # Normalize string content to content blocks
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}]
+
+            yield UserEvent(
+                raw=record,
+                content=content,
+                is_replay=True,
+            )
+
+        elif record_type == "assistant":
             message = record.get("message", {})
             content = message.get("content", [])
 

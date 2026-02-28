@@ -1,6 +1,6 @@
 """Alpha SDK — everything that turns Claude into Alpha."""
 
-__version__ = "1.0.0a5"
+__version__ = "1.0.0a6"
 
 from .client import AlphaClient
 from .engine import (
@@ -13,6 +13,7 @@ from .engine import (
     ResultEvent,
     StreamEvent,
     SystemEvent,
+    UserEvent,
 )
 from .queue import Message, MessageQueue
 from .replay import find_session_path, replay_session
@@ -30,6 +31,7 @@ __all__ = [
     # Events
     "Event",
     "InitEvent",
+    "UserEvent",
     "AssistantEvent",
     "ResultEvent",
     "SystemEvent",
