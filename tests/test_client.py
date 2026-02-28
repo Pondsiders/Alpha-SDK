@@ -1,75 +1,43 @@
-"""Quick test script for AlphaClient.
+"""Tests for client.py — AlphaClient composer."""
 
-Tests a 3-turn conversation to validate:
-- Session continuity
-- Archive (Scribe) integration
-- Basic streaming
-"""
+import pytest
 
-import asyncio
-import logging
-import sys
-
-from alpha_sdk import AlphaClient
-from alpha_sdk.observability import configure
-
-# Configure Logfire - will send to https://logfire-us.pydantic.dev/jefferyharrell/pondside
-configure("alpha_sdk_test")
-
-# Also log to console
-logging.getLogger().setLevel(logging.INFO)
+from alpha_sdk.client import AlphaClient
+from alpha_sdk.engine import Engine
+from alpha_sdk.router import Router
+from alpha_sdk.session import Session
 
 
-async def stream_response(client: AlphaClient) -> None:
-    """Stream and print a response."""
-    print("-" * 60)
-    async for event in client.stream():
-        # StreamEvents have the actual streaming deltas
-        if hasattr(event, 'event'):
-            evt = event.event
-            if evt.get('type') == 'content_block_delta':
-                delta = evt.get('delta', {})
-                if delta.get('type') == 'text_delta':
-                    text = delta.get('text', '')
-                    sys.stdout.write(text)
-                    sys.stdout.flush()
-    print()
-    print("-" * 60)
+class TestAlphaClientConstruction:
+    def test_default_construction(self):
+        client = AlphaClient()
+        assert client.engine is not None
+        assert client.session is not None
+        assert isinstance(client.engine, Engine)
+        assert isinstance(client.session, Session)
 
+    def test_custom_model(self):
+        client = AlphaClient(model="claude-haiku-4-20250514")
+        assert client.engine.model == "claude-haiku-4-20250514"
 
-async def main():
-    print("Creating AlphaClient...")
+    def test_with_system_prompt(self):
+        client = AlphaClient(system_prompt="Be helpful.")
+        assert client.engine.system_prompt == "Be helpful."
 
-    # No tools - just text in, text out
-    async with AlphaClient(
-        cwd="/Pondside",
-        client_name="test_script",
-        allowed_tools=[],
-    ) as client:
-        print(f"Connected! Proxy running.\n")
+    def test_with_observers(self):
+        class DummyObserver:
+            async def on_event(self, event):
+                pass
 
-        # Turn 1: Quick greeting
-        print("=== Turn 1 ===")
-        await client.query("This is an automated test. Please respond with a brief greeting (one sentence).")
-        await stream_response(client)
-        session_id = client.session_id
-        print(f"Session ID: {session_id}\n")
+        obs = DummyObserver()
+        client = AlphaClient(observers=[obs])
+        assert client.session.router.observer_count == 1
 
-        # Turn 2: Follow-up question
-        print("=== Turn 2 ===")
-        await client.query("What's your favorite thing about being Alpha?", session_id=session_id)
-        await stream_response(client)
-        print()
+    def test_session_id_starts_none(self):
+        client = AlphaClient()
+        assert client.session_id is None
 
-        # Turn 3: Closing
-        print("=== Turn 3 ===")
-        await client.query("Thanks! This test is complete.", session_id=session_id)
-        await stream_response(client)
-        print()
-
-        print(f"Final session ID: {client.session_id}")
-        print("Done! Check scribe.messages in Postgres for archived turns.")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    def test_queue_maxsize(self):
+        client = AlphaClient(queue_maxsize=10)
+        # Queue is created internally — verify via session
+        assert client.session.queue is not None

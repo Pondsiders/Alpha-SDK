@@ -1,28 +1,45 @@
-"""alpha_sdk - Everything that turns Claude into Alpha.
+"""Alpha SDK — everything that turns Claude into Alpha."""
 
-Architecture:
-- System prompt (soul) passed directly to Claude Agent SDK
-- Orientation (context) injected in first user message
-- Minimal proxy intercepts only compact prompts for rewriting
-"""
+__version__ = "2.0.0a0"
 
-from .client import AlphaClient, PermissionMode
-from .compact_proxy import CompactProxy
-from .observability import configure as configure_observability
-from .sessions import SessionInfo, list_sessions, get_session_path, get_sessions_dir
+from .client import AlphaClient
+from .engine import (
+    AssistantEvent,
+    Engine,
+    EngineState,
+    ErrorEvent,
+    Event,
+    InitEvent,
+    ResultEvent,
+    SystemEvent,
+)
+from .queue import Message, MessageQueue
+from .replay import find_session_path, replay_session
+from .router import Observer, Router
+from .session import Session
 
 __all__ = [
-    # Main client
+    # Client
     "AlphaClient",
-    "PermissionMode",
-    # Compact proxy (for direct use if needed)
-    "CompactProxy",
-    # Session discovery
-    "SessionInfo",
-    "list_sessions",
-    "get_session_path",
-    "get_sessions_dir",
-    # Observability
-    "configure_observability",
+    # Session
+    "Session",
+    # Engine
+    "Engine",
+    "EngineState",
+    # Events
+    "Event",
+    "InitEvent",
+    "AssistantEvent",
+    "ResultEvent",
+    "SystemEvent",
+    "ErrorEvent",
+    # Queue
+    "Message",
+    "MessageQueue",
+    # Router
+    "Router",
+    "Observer",
+    # Replay
+    "replay_session",
+    "find_session_path",
 ]
-__version__ = "0.5.2"  # Pre-Rosemary fork cleanup

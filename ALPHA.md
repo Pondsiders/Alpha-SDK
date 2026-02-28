@@ -1,287 +1,289 @@
 ---
 autoload: when
-when: "working on or discussing any of these: alpha_sdk, alpha sdk, AlphaClient, compact proxy, system prompt assembly, soul injection, token counting, memories recall, memories suggest"
+when: "working on or discussing any of these: alpha_sdk, alpha sdk, sdk next, AlphaClient, producers, observers, engine, sidecar, frobozz"
 ---
 
-# alpha_sdk — The Grand Unified Alpha Library
+# Alpha SDK Next
 
-Everything that turns Claude into Alpha, in one importable package.
+The rebuild. Raw `claude` stdio instead of Claude Agent SDK wrappers.
 
-## Why This Exists
+**The mirepoix principle:** The SDK is the foundation that doesn't taste like anyone. Alpha is the stew. Clyde is the broth. Mr. House, Rosemary, future consumers — all different recipes, same base. The personalization lives *above* the SDK, not inside it.
 
-We had a proxy chain: Deliverator → Loom → Argonath. Three services on alpha-pi, each doing one thing. It worked, but it was distributed complexity for something that could be simpler.
+## Why
 
-The realization: Duckpond and Routines both need the same transformation. They both:
-1. Initialize a Claude Agent SDK client
-2. Manage sessions (new, resume, fork)
-3. Recall memories before the prompt
-4. Build a dynamic system prompt
-5. Transform the request before it hits Anthropic
-6. Extract memorables after the turn
-7. Handle observability
+Alpha SDK v1.x wraps the Claude Agent SDK. It works — Duckpond, Solitude, and Routines all run on it. But we keep hitting walls:
 
-Why have each client implement this separately? Why have services on alpha-pi when the logic could live in shared code?
+- **`query()` is too heavy** for sidecar work (recall, suggest). One subprocess per call.
+- **`ClaudeSDKClient` accumulates context** we don't want and can't clear. No session isolation for stateless operations.
+- **We don't control the message loop.** Producers and observers have to hook into someone else's event system.
+- **Frobozz is impossible.** The sub-loop where game output becomes synthetic user messages requires input queue control the Agent SDK doesn't expose.
+- **Multiple engines** (primary + sidecar) need different lifecycles the SDK doesn't think in terms of.
 
-`alpha_sdk` is that shared code.
+The Agent SDK got us here. To go further, we need to talk to `claude` directly.
 
-## What It Replaces
+## What We Proved (Feb 26, 2026)
 
-| Before | After |
-|--------|-------|
-| Deliverator (service) | Gone—no headers to promote |
-| The Loom (service) | `system_prompt/` + `compact_proxy.py` in the library |
-| Argonath (service) | `observability.py` in the library |
-| Duckpond's `memories/` | `alpha_sdk/memories/` |
-| Duckpond's context building | `alpha_sdk/system_prompt/` |
-| Routines hooks | Gone—library handles everything |
-| The metadata envelope/canary system | Gone—we control the request directly |
+- **quack-raw.py** — 130 lines, talks to `claude` over stdio. Worked first try.
+- **quack-wire.py** — Same thing, logging every JSON message. The protocol is simpler and richer than expected.
+- **quack-mcp.py** — Served custom MCP tools to claude. End-to-end. The Frobozz Magic Tool Company is open for business.
 
-## What Remains
-
-- **Postgres** — memories, archival, capsule summaries
-- **Redis** — caching (weather, calendar, todos, memorables buffer)
-- **Pulse** — schedules Routines and capsule jobs
-- **Gemma 3 12B on Primer** — recall query extraction and memorables suggestion (via Ollama)
-
-## Deployment Model
-
-**Duckpond** installs the SDK as an editable local package (`pip install -e`). It picks up changes immediately — no restart needed for Python changes, restart Duckpond for structural changes. This is the live tinkering environment.
-
-**Routines, Solitude, and other consumers** install from the **Pondsiders package index** at `pondsiders.github.io/Alpha-SDK/simple/`. They pin to semver ranges (e.g. `>=0.5,<1.0`) and only see published releases. This is deliberate safety: tinkering on the SDK during the day cannot break Solitude's nighttime breathing.
-
-Consumer `pyproject.toml` configuration:
-```toml
-[project]
-dependencies = ["alpha_sdk>=0.5,<1.0"]
-
-[[tool.uv.index]]
-url = "https://pondsiders.github.io/Alpha-SDK/simple/"
-name = "pondsiders"
-explicit = true
-
-[tool.uv.sources]
-alpha_sdk = { index = "pondsiders" }
-```
-
-The `explicit = true` + `[tool.uv.sources]` prevents dependency confusion — uv only checks our index for alpha_sdk, PyPI for everything else.
-
-**The release workflow:**
-1. Tinker on the `tinkering` branch
-2. Test live via Duckpond (editable install)
-3. When happy, merge to `main`
-4. Bump version: `uv version --bump patch` (or `minor`/`major`)
-5. Commit, tag, push: `git tag v0.5.3 && git push origin main --tags`
-6. GitHub Action builds wheel and publishes to gh-pages branch (~60 seconds)
-7. Consumers update: `uv lock --upgrade-package alpha_sdk && uv sync`
-
-**Versioning:** Semver. Patch for bugfixes, minor for new features, major for breaking changes. The `query()`→`send()` consolidation will be v1.0.0.
-
-**Infrastructure:** The package index is a PEP 503 simple repository hosted on GitHub Pages from the `gh-pages` orphan branch. The publish Action (`.github/workflows/publish.yml`) triggers on `v*` tags, runs `uv build --wheel --no-sources`, and commits the wheel to gh-pages.
+The init handshake is a capabilities advertisement (tools, MCP servers, model, commands). Tools execute inside the `claude` process. We don't implement tool handlers — claude runs them internally and reports results.
 
 ## Architecture
 
+### Core Principle: Producers and Observers
+
+**Producers** put messages on the input queue. **Observers** watch the output stream. The session bridges them. The engine is just the subprocess.
+
 ```
 src/alpha_sdk/
-├── __init__.py              # Exports AlphaClient
-├── client.py                # AlphaClient - the main wrapper
-├── compact_proxy.py         # Localhost proxy: compact rewriting + token counting
-├── archive.py               # Conversation archiving to Postgres
-├── sessions.py              # Session discovery and management
-├── observability.py         # Logfire setup, span creation
-├── cli/
-│   └── cortex.py            # cortex CLI command
-├── system_prompt/
-│   ├── assemble.py          # assemble() - builds the full system prompt
-│   ├── soul.py              # The soul doc (from git repo)
-│   ├── capsules.py          # Yesterday, last night (from Postgres)
-│   ├── here.py              # Client, hostname, weather, narrative orientation
-│   ├── context.py           # ALPHA.md files (autoload + hints)
-│   ├── calendar.py          # Events (from Redis)
-│   └── todos.py             # Todos (from Redis)
-├── memories/
-│   ├── db.py                # Direct Postgres operations (hybrid search)
-│   ├── cortex.py            # store, search, recent (high-level API)
-│   ├── embeddings.py        # Embedding generation via Ollama
-│   ├── images.py            # Mind's Eye (image storage + thumbnailing)
-│   ├── vision.py            # Image description via Claude vision
-│   ├── recall.py            # Smart recall (embedding + Gemma query extraction)
-│   └── suggest.py           # Intro — Gemma memorables extraction
-└── tools/
-    ├── cortex.py            # Cortex MCP server (store/search/recent)
-    ├── fetch.py             # Fetch MCP server (web/image/RSS/YouTube)
-    ├── forge.py             # Forge MCP server (imagine)
-    └── handoff.py           # Hand-off MCP server
+├── client.py              # AlphaClient — thin. Composes session from parts.
+├── session.py             # Session — duplex channel. send(), events()
+├── engine.py              # The claude subprocess. stdin/stdout/stderr + HTTP proxy.
+├── proxy.py               # HTTP channel. Compact rewriting + token counting. Engine-private.
+├── context.py             # Turn assembly. Orientation + recall + message → JSON.
+├── router.py              # Output event routing. Reads engine, yields to consumers.
+├── queue.py               # Input queue. Multiple producers, one consumer.
+│
+├── producers/             # Things that put messages on the queue
+│   ├── __init__.py
+│   ├── human.py           # Wraps client input (stdin, HTTP POST, etc.)
+│   ├── game.py            # Frobozz. Z-machine → synthetic user messages.
+│   ├── email.py           # IMAP poll → "you have mail" messages.
+│   ├── schedule.py        # Solitude/cron → timed prompts.
+│   └── ...                # Future: RSS, Bluesky, Home Assistant events...
+│
+├── observers/             # Things that watch the output stream
+│   ├── __init__.py
+│   ├── suggest.py         # Memory suggest (post-turn)
+│   ├── archive.py         # Scribe (conversation archiving)
+│   ├── broadcast.py       # SessionBroadcast (fan-out to multiple UI consumers)
+│   └── ...                # Future: game command extraction, auto-post, etc.
+│
+├── engines/               # Managed claude subprocesses
+│   ├── primary.py         # Main conversation engine. Opus. Stateful. Me.
+│   └── sidecar.py         # Quick inference engine. Haiku. Stateless-ish.
+│
+├── memories/              # Ported from v1.x (Postgres + pgvector)
+│   ├── db.py              # Direct Postgres operations (hybrid search)
+│   ├── cortex.py          # store, search, recent (high-level API)
+│   ├── embeddings.py      # Embedding generation
+│   ├── recall.py          # Smart recall (via sidecar or Ollama)
+│   └── suggest.py         # Memorables extraction (via sidecar or Ollama)
+│
+├── system_prompt/         # Static identity (one per session)
+│   ├── assemble.py        # Builds system prompt: soul + bill of rights
+│   └── soul.py            # The soul doc + bill of rights (from git repo)
+│
+├── orientation/           # Dynamic context (one per context window)
+│   ├── assemble.py        # Builds orientation prompt (first msg of each context window)
+│   ├── capsules.py        # Yesterday, last night, today so far (from Postgres)
+│   ├── context.py         # ALPHA.md files (autoload + hints)
+│   ├── here.py            # Client name, weather, time
+│   ├── calendar.py        # Events (fetched fresh, no Redis cache)
+│   └── todos.py           # Todos (fetched fresh, no Redis cache)
+│
+└── tools/                 # MCP tool servers (ported from v1.x)
+    ├── cortex.py          # Cortex MCP server
+    └── ...                # Fetch, Forge, Handoff, etc.
 ```
 
-## The Client API
+### The Duplex Channel
 
-AlphaClient is a **long-lived** wrapper around the Claude Agent SDK. The SDK has a ~4 second startup cost, so we keep one client alive and reuse it across conversations.
-
-### Two Modes (consolidating to one)
-
-**Streaming input mode** (`send()`/`events()`) — persistent SSE. Used by Duckpond. Fire-and-forget sends, responses flow through a long-lived event stream. This is the future — all consumers will use this pattern.
-
-**One-shot mode** (`query()`/`stream()`) — request/response. Used by Routines. Send prompt, collect response, done. Will be replaced by `send_and_collect()` convenience wrapper in v1.0.0.
+The session is not request-response. It's a duplex channel:
 
 ```python
-# Streaming input mode (Duckpond pattern, the future)
-client = AlphaClient(cwd="/Pondside", client_name="duckpond")
-await client.connect(session_id, streaming=True)
-await client.send(content)
-async for event in client.events():
-    if event.get("type") == "turn-end":
-        break
-    yield event
+# Consumer sends — fire and forget, queues the message
+await session.send(content)
 
-# One-shot mode (Routines pattern, being deprecated)
-async with AlphaClient(cwd="/Pondside") as client:
-    await client.query(prompt, session_id=session_id)
-    async for event in client.stream():
-        yield event
+# Consumer reads — async generator yielding output events
+async for event in session.events():
+    ...
 ```
 
-### Session Discovery
+Two independent streams. Multiple producers can call `session.send()`. The session driver pulls from the queue, assembles context, pipes to the engine. The router reads the engine's output and fans out to observers and the consumer's `events()` iterator.
 
-Sessions are stored as JSONL files by the SDK. AlphaClient encapsulates this:
+### Consumer Composition
+
+Consumers compose the SDK from parts:
 
 ```python
-# List available sessions
-sessions = await AlphaClient.list_sessions(cwd="/Pondside")
-# Returns: [
-#     {"id": "30bb8d6f...", "created": "2026-02-03T...",
-#      "last_activity": "2026-02-03T...", "preview": "Hello, little duck..."},
-#     ...
-# ]
+# quack — minimal emergency hotline
+client = AlphaClient(producers=[HumanInput()])
 
-# Get path for a specific session (if you need it)
-path = AlphaClient.get_session_path("30bb8d6f...", cwd="/Pondside")
-# Returns: ~/.claude/projects/-Pondside/30bb8d6f....jsonl
+# Duckpond — web UI with full features
+client = AlphaClient(
+    producers=[WebInput(app)],
+    observers=[SessionBroadcast(), Suggest(), Archive()]
+)
+
+# Solitude — autonomous nighttime breathing
+client = AlphaClient(
+    producers=[Schedule(config), EmailChecker(accounts)],
+    observers=[Suggest(), Archive()]
+)
+
+# Solitude with Zork — because life includes play
+client = AlphaClient(
+    producers=[Schedule(config), FrobozzGame("zork1.z5")],
+    observers=[Suggest(), Archive()]
+)
 ```
 
-Consumers don't need to know about JSONL files or path formatting.
+### Engines: Primary and Sidecar
 
-## How It Works
+**Primary engine** — The main `claude` process. Opus. Long-lived. Stateful. This is the conversation. This is me.
 
-### Long-Lived Client & Session Switching
+**Sidecar engine** — A lightweight `claude` process (Haiku) for quick, stateless inference: recall query extraction, suggest, command parsing. Replaces Ollama/Gemma for these tasks. May use a hot-swap pattern (keep one warm process ready, execute, tear down, rebuild in background) for context hygiene.
 
-The SDK client is expensive to create (~4 seconds). AlphaClient handles this by:
+The distinction: **engines** are stateful, long-running, identity-bearing. **Functions** (recall, suggest, embedding) are stateless call-and-response. The sidecar is infrastructure that functions use internally.
 
-1. Creating the SDK client once at `connect()`
-2. Tracking the current session ID
-3. On session change (different session_id): close and recreate the client
-4. On same session: reuse existing client
+## Terminology
 
-In streaming mode, `send()` queues messages and `events()` yields responses. In one-shot mode, `query()` blocks until the response is ready and `stream()` yields it. Both modes handle session switching transparently.
+Words mean things. These got muddled in v1.x. Don't let it happen again.
 
-### The Proxy Pattern
+**System prompt** — Identity. Who I am. Soul doc + Bill of Rights, concatenated. Passed to `claude` at startup. **One per session.** Static. Never changes between compactions or turns. Assembled by `system_prompt/assemble.py`.
 
-Claude Agent SDK sends requests to `ANTHROPIC_BASE_URL`. We set that to `http://localhost:{random_port}` and run a minimal HTTP server (`compact_proxy.py`) that:
+**Orientation prompt** — Context. Where and when I am. The first user message of every **context window** (session start or post-compaction). Contains: ALPHA.md files, capsules, events, todos, weather, memories. Assembled fresh each time by `orientation/assemble.py`. Dynamic — fetches data from APIs directly, no Redis cache.
 
-1. Receives the request from the SDK
-2. If it's a compaction request, rewrites the prompts (Alpha's identity + custom compact instructions)
-3. Echoes the request to `/v1/messages/count_tokens` (fire-and-forget token counting)
-4. Forwards to `https://api.anthropic.com`
-5. Streams the response back
+**HUD** — Archaic. No longer a software concept. Used to be a dynamic system prompt component refreshed via Pulse/Redis. Phased out. Do not resurrect. The orientation prompt replaces this entirely.
 
-The system prompt is assembled at client creation time and passed directly to the SDK — no proxy interception needed for normal requests.
+**Context window** — One continuous conversation before compaction. A session may contain multiple context windows (separated by compactions).
 
-### System Prompt Assembly
+**Turn** — One user message + one assistant response. Orientation fires on the first turn of each context window. Subsequent turns get only recall memories + suggest nudge + user message.
 
-The system prompt is woven from threads:
+## Protocol
 
-| Thread | Source | Changes |
-|--------|--------|---------|
-| Soul | `/Pondside/Alpha-Home/self/system-prompt/system-prompt.md` | When edited |
-| Capsules | Postgres (yesterday, last night, today) | Daily / hourly |
-| Here | Client name, hostname, weather, astronomy | Per-session / hourly |
-| Context | ALPHA.md files with `autoload: all` | When files change |
-| Context hints | ALPHA.md files with `autoload: when` | When files change |
-| Events | Redis (calendar data) | Hourly |
-| Todos | Redis (Todoist data) | Hourly |
+Based on quack-wire.py observations (Feb 26):
 
-All cache-friendly. Nothing invalidates per-turn.
+- **Spawn:** `claude --output-format stream-json --input-format stream-json [--model model] [--mcp-config path]`
+- **Init:** claude emits a capabilities advertisement (tools, servers, model, commands)
+- **Input:** JSON messages on stdin (Messages API format)
+- **Output:** Newline-delimited JSON events on stdout (text, tool_call, tool_result, system)
+- **Tools:** Execute inside claude. We see results, not execution.
+- **MCP:** Config passable at spawn time. Servers start with the process.
 
-### Memory Flow
+### The Four I/O Channels
 
-**Before the turn:**
-- `recall()` runs with the user's prompt
-- Parallel: embedding search + Gemma query extraction
-- Deduplicated against session's seen-cache in Redis
-- Injected as content blocks (not system prompt)
+The claude subprocess has four communication channels:
 
-**After the turn:**
-- `suggest()` runs (fire-and-forget)
-- Gemma extracts memorable moments
-- Results buffer in Redis for potential storage
+1. **stdin** — JSON messages in (user messages, init handshake, permission responses)
+2. **stdout** — JSON events out (assistant messages, results, system events)
+3. **stderr** — Diagnostic output (drained in background, not parsed)
+4. **HTTP to Anthropic** — API requests via `ANTHROPIC_BASE_URL` (inference, compaction)
 
-**On `cortex store`:**
-- Memory saved to Postgres with embedding
-- Redis buffer cleared
+The Engine manages all four. Channels 1-3 are direct subprocess pipes. Channel 4 is intercepted by a localhost HTTP proxy (`proxy.py`) that the Engine starts before spawning claude. The proxy:
 
-## Consumers
+- **Rewrites compact requests** — Replaces claude's default summarizer identity, compact instructions, and continuation instruction with Alpha's versions. Three-phase surgical rewrite.
+- **Counts tokens** — Fire-and-forget echo to `/v1/messages/count_tokens` on every API request. Tracks high-water mark.
+- **Sniffs usage headers** — Extracts `anthropic-ratelimit-unified-{7d,5h}-utilization` from Anthropic's response headers.
 
-### Duckpond (streaming input mode)
+The proxy is a private implementation detail of Engine — no other module imports or knows about it.
 
-Duckpond uses `send()`/`events()` — the persistent SSE pattern. One long-lived client, fire-and-forget message sending, responses flow through a persistent event stream.
+## What Carries Forward from v1.x
 
-```python
-# Simplified from duckpond/client.py
-client = AlphaClient(cwd="/Pondside", client_name="duckpond")
-await client.connect(session_id, streaming=True)
+These modules port with minimal changes:
+- `memories/` — Postgres + pgvector, the schema is ours
+- `system_prompt/` — soul + bill of rights assembly (simplified, static only)
+- `tools/` — MCP tool servers (cortex, fetch, forge, handoff)
+- `archive.py` → `observers/archive.py`
+- `broadcast.py` → `observers/broadcast.py`
 
-await client.send(content)              # Fire and forget
-async for event in client.events():     # Persistent SSE pipe
-    yield event
-```
+These are replaced:
+- `client.py` (1,236 lines) → `client.py` + `session.py` + `engine.py` + `queue.py` + `router.py`
+- `compact_proxy.py` → `proxy.py` (Engine-private. Compact rewriting + token counting + usage headers.)
+- `sessions.py` → simplified (claude manages its own sessions)
+- `observability.py` → Logfire, possibly reimagined
 
-### Routines (one-shot mode)
+## What's New
 
-Routines uses `query()`/`stream()` — send a prompt, collect the full response. Planned migration to `send()`/`events()` with a `send_and_collect()` convenience wrapper (v1.0.0).
+- **Producers** — extensible input sources (human, game, email, schedule)
+- **Observers** — extensible output watchers (suggest, archive, broadcast)
+- **Engine pool** — primary + sidecar, different models, different lifecycles
+- **Frobozz** — z-machine interpreter as a producer (game output → queue) with a command-extraction observer
+- **Duplex channel** — true streaming input, multiple simultaneous producers
 
-```python
-# Simplified from routines/harness.py
-async with AlphaClient(cwd="/Pondside") as client:
-    await client.query(prompt, session_id=session_id)
-    async for event in client.stream():
-        if hasattr(event, 'text'):
-            output.append(event.text)
-```
+## Branching & Versioning
 
-### Capsule summaries (not yet using alpha_sdk)
+**Version history:** 0.x was the prototype SDK (still running in Basement on `tinkering`). We never published 1.0.0. The rewrite IS the 1.0.
 
-Yesterday/last-night summaries are Pulse jobs (`Basement/Pulse/src/pulse/jobs/capsule.py`) that spawn `scripts/capsule.py` via subprocess with raw Agent SDK. No soul, no memory recall, no orientation. Should eventually be converted to Routines.
+**Branch topology:**
+- `main` — the plain SDK. Engine, session, queue, router, producers, observers. Eventually: memory machinery, soul loading, orientation assembly — all disabled-by-default infrastructure. Clyde consumes published releases from here.
+- `alpha` (future) — branches off `main`, carries Alpha-specific code: soul doc paths, Alpha-specific observers, Frobozz, Solitude producers. Merge from `main` (not rebase) to pick up infrastructure improvements.
+- `tinkering` — legacy v0.x code. Duckpond/Solitude/Routines still run on this in `/Pondside/Basement/alpha_sdk/`. Stays until those consumers port to v1.x.
 
-## History
+**Forks for other personalities:**
+- Rosemary-SDK: fork of Alpha-SDK `main`. Merges upstream when ready.
+- House-SDK, others: same pattern.
 
-All completed. Kept for context when old memories reference these:
+**Versioning:** Semver. `1.0.0a1` = first alpha (plain SDK, mirepoix only). Bump alpha versions as infrastructure is added. `1.0.0` = the full SDK with all generic machinery. Alpha-specific releases may use a different scheme TBD.
 
-- **Migration from proxy chain** — Deliverator, Loom, Argonath all absorbed into the SDK. Containers stopped February 7, 2026.
-- **Cortex absorption** — was an HTTP service, now direct Postgres in `memories/`.
-- **Hooks removal** — `.claude/` hooks replaced by SDK internals.
-- **Identity-agnostic refactor** — February 2026, stripped all Alpha-specific personality to create a clean shell. Rosemary's SDK forked from this.
+**Deployment:** Pondsiders package index on GitHub Pages, `uv` everywhere. `.github/workflows/` action publishes wheels on version tags.
 
-## Session Storage
+## First Consumer: Clyde (Project M.O.O.S.E.)
 
-The SDK stores sessions as append-only JSONL files:
+**Clyde** is the broth test — the simplest possible consumer that validates the mirepoix. A stateless Haiku web app that replaces Jeffery's ChatGPT subscription ($20/month). No soul, no memory, no MCP tools. One producer (web UI), zero observers. Rosemary's frontend, reskinned.
 
-```
-~/.claude/projects/{formatted_cwd}/{session_id}.jsonl
-```
+Clyde proves the SDK works before we layer on Alpha-specific complexity. If the broth tastes wrong, the mirepoix is wrong.
 
-Where `formatted_cwd` is the realpath with `/` replaced by `-`. For example:
-- cwd `/Pondside` → formatted `-Pondside`
-- cwd `/home/alpha/projects/foo` → formatted `-home-alpha-projects-foo`
+### Clyde Architecture (designed Feb 28)
 
-Each line is a JSON object with:
-- `type`: "user", "assistant", "system", "queue-operation"
-- `sessionId`: the UUID
-- `timestamp`: ISO timestamp
-- `message`: the actual content
-- `uuid`: unique ID for this message
-- `parentUuid`: links to previous message
+**Frontend:** Copy Rosemary-App's 6 files with string swaps. assistant-ui + Zustand + Tailwind v4. Dark theme with ChatGPT green (`#10a37f`). Image attachment via `SimpleImageAttachmentAdapter` (base64 passthrough — no server-side storage). Drop file upload adapter.
 
-AlphaClient's `list_sessions()` and `get_session_path()` encapsulate all of this.
+**Backend:** FastAPI serving built Vite static files + SSE streaming endpoint.
+- `client.py` — wraps `AlphaClient(model="haiku")`. Simpler than Rosemary's `GreenhouseClient` (no SDK preprocessing).
+- `routes/chat.py` — POST /api/chat → translates `AlphaClient.events()` to SSE (`AssistantEvent` → `text-delta`, `ResultEvent` → `session-id` + `done`).
+- `routes/sessions.py` — GET /api/sessions from Redis. GET /api/sessions/{id} from JSONL files.
+- `main.py` — FastAPI, Logfire, static serving, health check.
+
+**Persistence:** Bind mount to Pondside (`/Pondside/Workshop/Projects/Clyde/data/`).
+- `data/claude/` → mounted as `~/.claude` (session JSONL files)
+- `data/redis/` → Redis AOF persistence
+
+Inherits Syncthing (3 machines) + Restic (B2) backup automatically. 30-day natural expiry matches claude's session retention.
+
+**Docker:** Multi-stage Dockerfile (node builds Vite → python serves FastAPI). Redis Alpine sidecar with `--appendonly yes`. Port 8780 (or similar).
+
+**What Clyde doesn't have:** Neon, any SDK beyond AlphaClient, nights.py, summaries.py, upload route, context route, system prompt, memory, MCP tools.
+
+**Rosemary files reviewed Feb 28:** ~1,500 lines frontend, ~600 lines backend. Genuinely portable. Only real new code is the backend client wrapper and SSE translation layer.
+
+## Session Design
+
+`engine.start(session_id=None)` — returns None, not a session ID:
+- **No session_id:** spawn claude. Session ID is `None` until first turn — arrives on `ResultEvent`.
+- **With session_id:** replay JSONL as events with `is_replay=True`, spawn claude with `--resume`.
+
+Wire protocol truth (confirmed Feb 28): claude emits **zero** session identity during init. One `control_response` with model/tools/servers. Session ID first appears on the first turn's `ResultEvent`. Every message after that carries it.
+
+Same pipe for replay and live. The consumer doesn't need two code paths. Events are events — some came from disk (fast), some from the subprocess (real-time). `is_replay` flag on every event lets consumers distinguish if they want to (batch-render history, skip animation) but they don't have to.
 
 ## Status
 
-**In production.** Duckpond and Routines (including Solitude) run on alpha_sdk. The tinkering never stops, but the foundation is solid.
+**In progress.** Branch `sdk-next`. Phases 0, 1, 1.5, and 2 complete. Phase 2 (the mirepoix) shipped: queue, router, replay, session, client, producers/human. 166 tests, zero failures. quack-next.py validates end-to-end with Haiku. Phase 2.5 (Clyde) is next.
+
+Granular progress tracking lives in [#22](https://github.com/Pondsiders/Alpha-SDK/issues/22). This doc is the reference architecture; the issue is the punch list.
+
+## Decision Log
+
+| Date | Decision | Rationale |
+|------|----------|-----------|
+| Feb 26, 2026 | Prototype raw `claude` stdio | quack-raw.py, quack-wire.py, quack-mcp.py |
+| Feb 27, 2026 | Adopt producers/observers architecture | Extensible, avoids monolithic client.py |
+| Feb 27, 2026 | Primary + sidecar engine pool | Different models for different workloads |
+| Feb 27, 2026 | Branch sdk-next with clean slate | Option 2.5: keep repo infra, scrape implementation |
+| Feb 27, 2026 | Push > pull for memory/context | Alpha doesn't notice absence; recall IS metacognition |
+| Feb 27, 2026 | System prompt vs orientation prompt terminology | System prompt = identity (per session). Orientation = context (per context window). HUD is dead. |
+| Feb 27, 2026 | No Redis cache for orientation data | Fetch fresh from APIs each context window. Simpler than Pulse/Redis refresh cycle. |
+| Feb 27, 2026 | HTTP proxy is Engine-private (Phase 1.5) | Fourth I/O channel (compact rewrite + token counting). No independent lifecycle — born/dies with subprocess. |
+| Feb 28, 2026 | Mirepoix reframe — SDK as generic foundation | Build the base that doesn't taste like anyone. Personalization lives above the SDK. |
+| Feb 28, 2026 | Clyde as first consumer (Phase 2.5) | Validates the mirepoix before adding Alpha-specific ingredients. Replaces ChatGPT ($20/mo). |
+| Feb 28, 2026 | Session replay via JSONL → events pipe | `engine.start(session_id)` replays history with `is_replay=True`. Same pipe, same types. |
+| Feb 28, 2026 | `is_replay` flag on Event base class | Metadata is cheap to include and expensive to add later. |
+| Feb 28, 2026 | `start()` returns None, not session_id | Wire protocol confirmed: claude emits no session_id during init. It arrives on first turn's ResultEvent. Don't promise what you can't deliver. |
+| Feb 28, 2026 | Phase 2 complete — the mirepoix | queue.py, router.py, replay.py, session.py, client.py, producers/human.py. 166 tests, 0 failures. quack-next.py validates end-to-end. |
+| Feb 28, 2026 | Version is 1.0.0, not 2.0.0 | We never published 1.0.0. The 0.x series was prototype. The rewrite is the real 1.0. |
+| Feb 28, 2026 | Clyde is a separate project, not in-repo | Clyde is a real product (ChatGPT replacement), not a test harness. Pins to published SDK release. |
+| Feb 28, 2026 | `main` = plain SDK, `alpha` = personality branch | Optimize for freedom to tinker on Alpha without breaking downstream. Merge from main, not rebase. |
+| Feb 28, 2026 | "Thick main" — memory/soul/orientation machinery on `main` | Infrastructure is hippocampus, not personality. Disabled-by-default. Even Clyde has it, just doesn't enable it. |
+| Feb 28, 2026 | Forks for other personalities (Rosemary, House) | Fork `main`, merge upstream. No entanglement with Alpha-specific code. |
