@@ -54,11 +54,11 @@ class TestEngineLifecycle:
     async def test_start_and_stop(self, test_engine):
         """Engine can start (init handshake) and stop cleanly."""
         try:
-            init = await test_engine.start()
+            await test_engine.start()
 
             assert test_engine.state == EngineState.READY
             assert test_engine.pid is not None
-            assert isinstance(init, InitEvent)
+            assert test_engine.session_id is None  # Not known until first turn
         finally:
             await test_engine.stop()
             assert test_engine.state == EngineState.STOPPED
@@ -92,12 +92,17 @@ class TestEngineLifecycle:
         finally:
             await test_engine.stop()
 
-    async def test_init_reports_model(self, test_engine):
-        """Init event should report the model being used."""
+    async def test_session_id_discovered(self, test_engine):
+        """Engine discovers session_id from init or first turn."""
         try:
-            init = await test_engine.start()
-            # Model name might be the full name or an alias
-            # Just verify we got something back
-            assert init.raw, "Init event has no raw data"
+            await test_engine.start()
+            # Session ID might not be known until the first turn
+            await test_engine.send("Say hi.")
+            async for event in test_engine.events():
+                if isinstance(event, ResultEvent):
+                    break
+            # After first turn, session_id should be discovered
+            assert test_engine.session_id is not None
+            assert len(test_engine.session_id) > 0
         finally:
             await test_engine.stop()

@@ -12,7 +12,9 @@ The Engine manages all four channels:
 
 Usage:
     engine = Engine(model="claude-sonnet-4-20250514")
-    init = await engine.start()
+    await engine.start()            # New session
+    await engine.start("abc-123")   # Resume session
+    # engine.session_id is None until first turn completes
     await engine.send("Hello!")
     async for event in engine.events():
         if isinstance(event, AssistantEvent):
@@ -56,6 +58,7 @@ class Event:
     """Base event from the claude process."""
 
     raw: dict
+    is_replay: bool = False
 
 
 @dataclass
@@ -157,10 +160,16 @@ class Engine:
         self._proc: asyncio.subprocess.Process | None = None
         self._stderr_task: asyncio.Task | None = None
         self._proxy: _Proxy | None = None
+        self._session_id: str | None = None
 
     @property
     def state(self) -> EngineState:
         return self._state
+
+    @property
+    def session_id(self) -> str | None:
+        """Session ID discovered during init or provided at start."""
+        return self._session_id
 
     @property
     def pid(self) -> int | None:
@@ -195,17 +204,21 @@ class Engine:
 
     # -- Lifecycle ------------------------------------------------------------
 
-    async def start(self) -> InitEvent:
+    async def start(self, session_id: str | None = None) -> None:
         """Spawn claude and perform the init handshake.
 
-        Returns the InitEvent containing capabilities (model, tools, servers).
-        Raises RuntimeError if the engine is not IDLE or if claude exits
-        during the handshake.
+        Args:
+            session_id: If provided, resume this session (adds --resume flag).
+                        If None, start a new session.
+
+        The session ID is not known until the first turn completes.
+        After the first turn, read it from engine.session_id.
         """
         if self._state != EngineState.IDLE:
             raise RuntimeError(f"Cannot start engine in state {self._state}")
 
         self._state = EngineState.STARTING
+        self._session_id = session_id  # Known for resume, None for new
 
         try:
             # Start the HTTP proxy BEFORE spawning claude so
@@ -215,9 +228,8 @@ class Engine:
 
             self._proc = await self._spawn()
             self._stderr_task = asyncio.create_task(self._drain_stderr())
-            init_event = await self._init_handshake()
+            await self._init_handshake()
             self._state = EngineState.READY
-            return init_event
         except Exception:
             self._state = EngineState.STOPPED
             await self._cleanup()
@@ -259,6 +271,11 @@ class Engine:
                 # Auto-approve and continue — don't yield to consumer
                 await self._send_permission_response(event.request_id)
                 continue
+
+            # Capture session_id from first ResultEvent if not yet known
+            if isinstance(event, ResultEvent) and not self._session_id:
+                if event.session_id:
+                    self._session_id = event.session_id
 
             yield event
 
@@ -375,6 +392,9 @@ class Engine:
 
         if self.mcp_config:
             cmd.extend(["--mcp-config", self.mcp_config])
+
+        if self._session_id:
+            cmd.extend(["--resume", self._session_id])
 
         if self.extra_args:
             cmd.extend(self.extra_args)
