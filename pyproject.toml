@@ -1,6 +1,6 @@
 [project]
 name = "alpha_sdk"
-version = "1.0.0a1"
+version = "1.0.0a2"
 description = "The plain SDK — engine, session, producers, observers"
 requires-python = ">=3.11"
 dependencies = [
@@ -9,6 +9,9 @@ dependencies = [
     # Phase 1.5: HTTP proxy for compact rewriting + token counting
     "aiohttp>=3.9.0",
     "httpx>=0.27.0",
+    # The claude runtime. Bundles the native CLI binary.
+    # Pinned exact — we upgrade intentionally, not by accident.
+    "claude-agent-sdk==0.1.44",
 ]
 
 [project.optional-dependencies]

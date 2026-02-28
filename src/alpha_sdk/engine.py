@@ -31,9 +31,40 @@ import json
 import os
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from pathlib import Path
 from typing import AsyncIterator
 
 from .proxy import CompactConfig, _Proxy
+
+
+def _bundled_claude_path() -> str:
+    """Resolve the claude binary bundled inside claude-agent-sdk.
+
+    This is the ONLY way we find claude. No PATH lookup, no fallback
+    locations. If claude-agent-sdk isn't installed or the binary is
+    missing, we fail loud and clear.
+    """
+    try:
+        import claude_agent_sdk._bundled as _bundled
+    except ImportError:
+        raise RuntimeError(
+            "claude-agent-sdk is not installed. "
+            "alpha_sdk requires claude-agent-sdk — install it or "
+            "check that your environment has the right dependencies."
+        )
+
+    # _bundled is a namespace package — __file__ is None, but
+    # __path__ has the directory. Use the first (only) path entry.
+    bundled_dir = Path(_bundled.__path__[0])
+    binary = bundled_dir / "claude"
+
+    if not binary.exists():
+        raise RuntimeError(
+            f"Bundled claude binary not found at {binary}. "
+            f"claude-agent-sdk may be corrupt — reinstall it."
+        )
+
+    return str(binary)
 
 
 # -- State machine ------------------------------------------------------------
@@ -379,7 +410,7 @@ class Engine:
     async def _spawn(self) -> asyncio.subprocess.Process:
         """Spawn the claude binary with stream-json protocol."""
         cmd = [
-            "claude",
+            _bundled_claude_path(),
             "--output-format", "stream-json",
             "--input-format", "stream-json",
             "--verbose",
