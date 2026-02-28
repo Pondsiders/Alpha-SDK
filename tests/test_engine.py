@@ -224,24 +224,39 @@ class TestParseEdgeCases:
 
 
 class TestFormatUserMessage:
-    """Test user message construction."""
+    """Test user message construction — content blocks format."""
 
-    def test_basic_message(self):
-        msg = Engine._format_user_message("Hello!")
+    def test_text_only(self):
+        blocks = [{"type": "text", "text": "Hello!"}]
+        msg = Engine._format_user_message(blocks)
         assert msg["type"] == "user"
         assert msg["message"]["role"] == "user"
-        assert msg["message"]["content"] == "Hello!"
+        assert msg["message"]["content"] == blocks
         assert msg["session_id"] == ""
         assert msg["parent_tool_use_id"] is None
 
-    def test_preserves_content_exactly(self):
-        text = "line 1\nline 2\n  indented\ttabbed"
-        msg = Engine._format_user_message(text)
-        assert msg["message"]["content"] == text
+    def test_multimodal(self):
+        blocks = [
+            {"type": "text", "text": "What's this?"},
+            {"type": "image", "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": "abc123==",
+            }},
+        ]
+        msg = Engine._format_user_message(blocks)
+        assert msg["message"]["content"] == blocks
+        assert len(msg["message"]["content"]) == 2
+        assert msg["message"]["content"][1]["type"] == "image"
 
-    def test_empty_string(self):
-        msg = Engine._format_user_message("")
-        assert msg["message"]["content"] == ""
+    def test_preserves_content_exactly(self):
+        blocks = [{"type": "text", "text": "line 1\nline 2\n  indented\ttabbed"}]
+        msg = Engine._format_user_message(blocks)
+        assert msg["message"]["content"] == blocks
+
+    def test_empty_list(self):
+        msg = Engine._format_user_message([])
+        assert msg["message"]["content"] == []
 
 
 class TestFormatInitRequest:

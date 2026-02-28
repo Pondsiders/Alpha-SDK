@@ -135,7 +135,7 @@ def sample_user_message():
     return {
         "type": "user",
         "session_id": "",
-        "message": {"role": "user", "content": "Hello, world!"},
+        "message": {"role": "user", "content": [{"type": "text", "text": "Hello, world!"}]},
         "parent_tool_use_id": None,
     }
 

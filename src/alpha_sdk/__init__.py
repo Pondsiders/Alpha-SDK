@@ -1,6 +1,6 @@
 """Alpha SDK — everything that turns Claude into Alpha."""
 
-__version__ = "1.0.0a4"
+__version__ = "1.0.0a5"
 
 from .client import AlphaClient
 from .engine import (

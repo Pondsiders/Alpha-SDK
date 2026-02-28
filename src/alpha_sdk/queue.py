@@ -23,11 +23,11 @@ from dataclasses import dataclass, field
 class Message:
     """A message on the queue.
 
-    content: The text content to send to the engine.
+    content: Messages API content blocks to send to the engine.
     producer: Name of the producer that created this message (for logging/debugging).
     """
 
-    content: str
+    content: list[dict]
     producer: str = ""
 
 

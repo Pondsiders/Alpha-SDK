@@ -102,14 +102,14 @@ class Session:
         # Start the background driver that pulls from queue → engine → router
         self._driver_task = asyncio.create_task(self._drive())
 
-    async def send(self, content: str, producer: str = "") -> None:
+    async def send(self, content: list[dict], producer: str = "") -> None:
         """Send a message to the session.
 
         This queues the message. The driver will send it to the engine
         when it's ready.
 
         Args:
-            content: The message text.
+            content: Messages API content blocks.
             producer: Name of the producer (for logging/debugging).
         """
         await self._queue.put(Message(content=content, producer=producer))

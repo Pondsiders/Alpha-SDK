@@ -6,8 +6,8 @@ from alpha_sdk import __version__
 
 
 def test_version():
-    """Package version is 2.0.0 alpha."""
-    assert __version__ == "2.0.0a0"
+    """Package version matches pyproject.toml."""
+    assert __version__ == "1.0.0a5"
 
 
 def test_fixtures_load(sample_init_response, sample_assistant_message, sample_result):
@@ -41,6 +41,6 @@ def test_user_message_format(sample_user_message):
     """User messages have the expected wire protocol structure."""
     assert sample_user_message["type"] == "user"
     assert sample_user_message["message"]["role"] == "user"
-    assert isinstance(sample_user_message["message"]["content"], str)
+    assert isinstance(sample_user_message["message"]["content"], list)
     assert sample_user_message["session_id"] == ""
     assert sample_user_message["parent_tool_use_id"] is None

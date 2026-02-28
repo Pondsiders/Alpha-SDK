@@ -310,15 +310,22 @@ class Engine:
             await self._cleanup()
             raise
 
-    async def send(self, text: str) -> None:
+    async def send(self, content: list[dict]) -> None:
         """Send a user message to claude.
+
+        Args:
+            content: Messages API content blocks, e.g.
+                [{"type": "text", "text": "Hello!"}]
+                or multimodal:
+                [{"type": "text", "text": "What's this?"},
+                 {"type": "image", "source": {"type": "base64", ...}}]
 
         The message is queued on stdin. Call events() to read the response.
         """
         if self._state != EngineState.READY:
             raise RuntimeError(f"Cannot send in state {self._state}")
 
-        await self._send_json(self._format_user_message(text))
+        await self._send_json(self._format_user_message(content))
 
     async def events(self) -> AsyncIterator[Event]:
         """Yield events from claude's response stream.
@@ -368,12 +375,16 @@ class Engine:
     # -- Protocol helpers (static, unit-testable) -----------------------------
 
     @staticmethod
-    def _format_user_message(text: str) -> dict:
-        """Format a user message for claude's stdin."""
+    def _format_user_message(content: list[dict]) -> dict:
+        """Format a user message for claude's stdin.
+
+        Args:
+            content: Messages API content blocks.
+        """
         return {
             "type": "user",
             "session_id": "",
-            "message": {"role": "user", "content": text},
+            "message": {"role": "user", "content": content},
             "parent_tool_use_id": None,
         }
 

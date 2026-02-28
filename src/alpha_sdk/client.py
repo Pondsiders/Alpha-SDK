@@ -103,7 +103,7 @@ class AlphaClient:
         """
         await self._session.start(session_id=session_id)
 
-    async def send(self, content: str, producer: str = "") -> None:
+    async def send(self, content: list[dict], producer: str = "") -> None:
         """Send a message to the session."""
         await self._session.send(content, producer=producer)
 
