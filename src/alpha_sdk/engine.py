@@ -418,7 +418,7 @@ class Engine:
             "--permission-mode", self.permission_mode,
         ]
 
-        if self.system_prompt:
+        if self.system_prompt is not None:
             cmd.extend(["--system-prompt", self.system_prompt])
 
         if self.mcp_config:
