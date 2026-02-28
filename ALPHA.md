@@ -7,6 +7,8 @@ when: "working on or discussing any of these: alpha_sdk, alpha sdk, sdk next, Al
 
 The rebuild. Raw `claude` stdio instead of Claude Agent SDK wrappers.
 
+**The mirepoix principle:** The SDK is the foundation that doesn't taste like anyone. Alpha is the stew. Clyde is the broth. Mr. House, Rosemary, future consumers — all different recipes, same base. The personalization lives *above* the SDK, not inside it.
+
 ## Why
 
 Alpha SDK v1.x wraps the Claude Agent SDK. It works — Duckpond, Solitude, and Routines all run on it. But we keep hitting walls:
@@ -204,11 +206,12 @@ These are replaced:
 ## Migration Path
 
 1. Build SDK Next on the `sdk-next` branch (worktree: `/Pondside/Workshop/Projects/alpha_sdk-next`)
-2. Test with `quack-next` (minimal CLI consumer)
-3. Port Duckpond when quack-next is stable
-4. Port Solitude/Routines
-5. Merge to main as v2.0.0
-6. Existing consumers pin `>=1.0,<2.0` until ready to upgrade
+2. **Clyde** — first real consumer, validates the generic SDK (Phase 2.5)
+3. `quack-next` — minimal CLI consumer
+4. Port Duckpond
+5. Port Solitude/Routines
+6. Merge to main as v2.0.0
+7. Existing consumers pin `>=1.0,<2.0` until ready to upgrade
 
 Current SDK stays running in `/Pondside/Basement/alpha_sdk/` (branch: tinkering). Nothing breaks during the build.
 
@@ -216,9 +219,23 @@ Current SDK stays running in `/Pondside/Basement/alpha_sdk/` (branch: tinkering)
 
 Same as v1.x: Pondsiders package index on GitHub Pages, semver, `uv` everywhere. The `.github/workflows/` action carries forward unchanged.
 
+## First Consumer: Clyde (Project M.O.O.S.E.)
+
+**Clyde** is the broth test — the simplest possible consumer that validates the mirepoix. A stateless Haiku web app that replaces Jeffery's ChatGPT subscription ($20/month). No soul, no memory, no MCP tools. One producer (web UI), zero observers. Rosemary's frontend, reskinned.
+
+Clyde proves the SDK works before we layer on Alpha-specific complexity. If the broth tastes wrong, the mirepoix is wrong.
+
+## Session Design
+
+`engine.start(session_id=None) → str (UUID)`:
+- **No session_id:** spawn claude, discover ID from init handshake, return it
+- **With session_id:** read claude's JSONL transcript, emit replay events with `is_replay=True`, spawn claude with `--resume`, return ID as confirmation
+
+Same pipe for replay and live. The consumer doesn't need two code paths. Events are events — some came from disk (fast), some from the subprocess (real-time). `is_replay` flag on every event lets consumers distinguish if they want to (batch-render history, skip animation) but they don't have to.
+
 ## Status
 
-**In progress.** Branch `sdk-next`, baseline commit `4971b37`. The room is empty. The chalkboard is clean.
+**In progress.** Branch `sdk-next`, baseline commit `4971b37`. Phase 0, Phase 1, and Phase 1.5 complete (engine.py + proxy.py, 86 tests, zero failures). Phase 2 (the mirepoix) is next.
 
 Granular progress tracking lives in [#22](https://github.com/Pondsiders/Alpha-SDK/issues/22). This doc is the reference architecture; the issue is the punch list.
 
@@ -234,3 +251,7 @@ Granular progress tracking lives in [#22](https://github.com/Pondsiders/Alpha-SD
 | Feb 27, 2026 | System prompt vs orientation prompt terminology | System prompt = identity (per session). Orientation = context (per context window). HUD is dead. |
 | Feb 27, 2026 | No Redis cache for orientation data | Fetch fresh from APIs each context window. Simpler than Pulse/Redis refresh cycle. |
 | Feb 27, 2026 | HTTP proxy is Engine-private (Phase 1.5) | Fourth I/O channel (compact rewrite + token counting). No independent lifecycle — born/dies with subprocess. |
+| Feb 28, 2026 | Mirepoix reframe — SDK as generic foundation | Build the base that doesn't taste like anyone. Personalization lives above the SDK. |
+| Feb 28, 2026 | Clyde as first consumer (Phase 2.5) | Validates the mirepoix before adding Alpha-specific ingredients. Replaces ChatGPT ($20/mo). |
+| Feb 28, 2026 | Session replay via JSONL → events pipe | `engine.start(session_id)` replays history with `is_replay=True`. Same pipe, same types. |
+| Feb 28, 2026 | `is_replay` flag on Event base class | Metadata is cheap to include and expensive to add later. |
