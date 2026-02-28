@@ -146,6 +146,50 @@ class ErrorEvent(Event):
     message: str = ""
 
 
+@dataclass
+class StreamEvent(Event):
+    """Streaming delta from claude (with --include-partial-messages).
+
+    Wraps the Anthropic Messages API streaming format:
+    - content_block_start: new block beginning (text, thinking, tool_use)
+    - content_block_delta: incremental chunk (text_delta, thinking_delta)
+    - content_block_stop: block complete
+    - message_start, message_delta, message_stop: message-level events
+
+    These arrive BEFORE the complete AssistantEvent for the same content.
+    Consumers that want streaming use these; consumers that don't can
+    ignore them and use AssistantEvent as before.
+    """
+
+    inner: dict = field(default_factory=dict)
+
+    @property
+    def event_type(self) -> str:
+        """Inner event type: content_block_start, content_block_delta, etc."""
+        return self.inner.get("type", "")
+
+    @property
+    def index(self) -> int:
+        """Content block index (0-based)."""
+        return self.inner.get("index", 0)
+
+    @property
+    def delta_type(self) -> str:
+        """Delta type: text_delta, thinking_delta, input_json_delta, etc."""
+        return self.inner.get("delta", {}).get("type", "")
+
+    @property
+    def delta_text(self) -> str:
+        """Extract text from text_delta or thinking_delta."""
+        delta = self.inner.get("delta", {})
+        return delta.get("text", "") or delta.get("thinking", "")
+
+    @property
+    def block_type(self) -> str:
+        """Block type from content_block_start events."""
+        return self.inner.get("content_block", {}).get("type", "")
+
+
 # Internal — not yielded to consumers
 @dataclass
 class _ControlRequestEvent(Event):
@@ -402,6 +446,11 @@ class Engine:
                 mcp_servers=resp.get("mcpServers", []),
             )
 
+        elif msg_type == "stream_event":
+            # Streaming delta — Messages API format wrapped by claude
+            inner = raw.get("event", {})
+            return StreamEvent(raw=raw, inner=inner)
+
         else:
             return Event(raw=raw)
 
@@ -416,6 +465,7 @@ class Engine:
             "--verbose",
             "--model", self.model,
             "--permission-mode", self.permission_mode,
+            "--include-partial-messages",
         ]
 
         if self.system_prompt is not None:

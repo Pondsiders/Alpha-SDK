@@ -1,6 +1,6 @@
 [project]
 name = "alpha_sdk"
-version = "1.0.0a3"
+version = "1.0.0a4"
 description = "The plain SDK — engine, session, producers, observers"
 requires-python = ">=3.11"
 dependencies = [

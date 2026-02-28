@@ -1,6 +1,6 @@
 """Alpha SDK — everything that turns Claude into Alpha."""
 
-__version__ = "2.0.0a0"
+__version__ = "1.0.0a4"
 
 from .client import AlphaClient
 from .engine import (
@@ -11,6 +11,7 @@ from .engine import (
     Event,
     InitEvent,
     ResultEvent,
+    StreamEvent,
     SystemEvent,
 )
 from .queue import Message, MessageQueue
@@ -33,6 +34,7 @@ __all__ = [
     "ResultEvent",
     "SystemEvent",
     "ErrorEvent",
+    "StreamEvent",
     # Queue
     "Message",
     "MessageQueue",

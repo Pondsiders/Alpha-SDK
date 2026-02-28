@@ -13,6 +13,7 @@ from alpha_sdk.engine import (
     InitEvent,
     AssistantEvent,
     ResultEvent,
+    StreamEvent,
     SystemEvent,
     ErrorEvent,
     _ControlRequestEvent,
@@ -202,7 +203,7 @@ class TestParseEdgeCases:
     """Edge cases in event parsing."""
 
     def test_unknown_type(self):
-        raw = {"type": "stream_event", "data": "something"}
+        raw = {"type": "rate_limit_event", "data": "something"}
         event = Engine._parse_event(raw)
         assert type(event) is Event
         assert event.raw is raw
@@ -438,3 +439,188 @@ class TestAssistantEventText:
             content=[{"type": "text"}],
         )
         assert event.text == ""
+
+
+# -- StreamEvent parsing and properties ----------------------------------------
+
+
+class TestParseStreamEvent:
+    """Parse stream_event messages from --include-partial-messages."""
+
+    def test_text_delta(self):
+        raw = {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "text_delta", "text": "Hello"},
+            },
+            "session_id": "sess_abc",
+        }
+        event = Engine._parse_event(raw)
+        assert isinstance(event, StreamEvent)
+        assert event.event_type == "content_block_delta"
+        assert event.delta_type == "text_delta"
+        assert event.delta_text == "Hello"
+        assert event.index == 1
+
+    def test_thinking_delta(self):
+        raw = {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "Let me think..."},
+            },
+        }
+        event = Engine._parse_event(raw)
+        assert isinstance(event, StreamEvent)
+        assert event.delta_type == "thinking_delta"
+        assert event.delta_text == "Let me think..."
+        assert event.index == 0
+
+    def test_content_block_start_text(self):
+        raw = {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "text", "text": ""},
+            },
+        }
+        event = Engine._parse_event(raw)
+        assert isinstance(event, StreamEvent)
+        assert event.event_type == "content_block_start"
+        assert event.block_type == "text"
+        assert event.index == 1
+
+    def test_content_block_start_thinking(self):
+        raw = {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+            },
+        }
+        event = Engine._parse_event(raw)
+        assert isinstance(event, StreamEvent)
+        assert event.block_type == "thinking"
+
+    def test_content_block_stop(self):
+        raw = {
+            "type": "stream_event",
+            "event": {"type": "content_block_stop", "index": 1},
+        }
+        event = Engine._parse_event(raw)
+        assert isinstance(event, StreamEvent)
+        assert event.event_type == "content_block_stop"
+        assert event.index == 1
+
+    def test_message_start(self):
+        raw = {
+            "type": "stream_event",
+            "event": {
+                "type": "message_start",
+                "message": {
+                    "model": "claude-haiku-4-5-20251001",
+                    "id": "msg_abc",
+                    "role": "assistant",
+                    "content": [],
+                },
+            },
+        }
+        event = Engine._parse_event(raw)
+        assert isinstance(event, StreamEvent)
+        assert event.event_type == "message_start"
+
+    def test_message_stop(self):
+        raw = {
+            "type": "stream_event",
+            "event": {"type": "message_stop"},
+        }
+        event = Engine._parse_event(raw)
+        assert isinstance(event, StreamEvent)
+        assert event.event_type == "message_stop"
+
+    def test_message_delta(self):
+        raw = {
+            "type": "stream_event",
+            "event": {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 50},
+            },
+        }
+        event = Engine._parse_event(raw)
+        assert isinstance(event, StreamEvent)
+        assert event.event_type == "message_delta"
+
+    def test_raw_preserved(self):
+        raw = {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "hi"},
+            },
+        }
+        event = Engine._parse_event(raw)
+        assert event.raw is raw
+
+    def test_empty_event(self):
+        """Malformed stream_event — missing 'event' key."""
+        raw = {"type": "stream_event"}
+        event = Engine._parse_event(raw)
+        assert isinstance(event, StreamEvent)
+        assert event.inner == {}
+        assert event.event_type == ""
+        assert event.delta_type == ""
+        assert event.delta_text == ""
+
+    def test_is_replay_default_false(self):
+        raw = {
+            "type": "stream_event",
+            "event": {"type": "content_block_delta", "index": 0,
+                      "delta": {"type": "text_delta", "text": "x"}},
+        }
+        event = Engine._parse_event(raw)
+        assert event.is_replay is False
+
+
+class TestStreamEventProperties:
+    """Test StreamEvent convenience properties in isolation."""
+
+    def test_delta_text_prefers_text_over_thinking(self):
+        """text_delta has 'text', thinking_delta has 'thinking'.
+        delta_text should return whichever is present."""
+        # text_delta
+        evt = StreamEvent(raw={}, inner={
+            "delta": {"type": "text_delta", "text": "hello"},
+        })
+        assert evt.delta_text == "hello"
+
+        # thinking_delta
+        evt = StreamEvent(raw={}, inner={
+            "delta": {"type": "thinking_delta", "thinking": "hmm"},
+        })
+        assert evt.delta_text == "hmm"
+
+    def test_delta_text_empty_for_non_text_delta(self):
+        """signature_delta has neither 'text' nor 'thinking'."""
+        evt = StreamEvent(raw={}, inner={
+            "delta": {"type": "signature_delta", "signature": "EoU..."},
+        })
+        assert evt.delta_text == ""
+
+    def test_index_defaults_to_zero(self):
+        evt = StreamEvent(raw={}, inner={})
+        assert evt.index == 0
+
+    def test_block_type_for_non_start(self):
+        """block_type returns '' for non-content_block_start events."""
+        evt = StreamEvent(raw={}, inner={
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "x"},
+        })
+        assert evt.block_type == ""
