@@ -1,7 +1,7 @@
 [project]
 name = "alpha_sdk"
-version = "2.0.0a0"
-description = "Everything that turns Claude into Alpha"
+version = "1.0.0a1"
+description = "The plain SDK — engine, session, producers, observers"
 requires-python = ">=3.11"
 dependencies = [
     # Phase 0: minimal. Add dependencies as phases require them.

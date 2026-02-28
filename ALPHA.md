@@ -203,21 +203,22 @@ These are replaced:
 - **Frobozz** — z-machine interpreter as a producer (game output → queue) with a command-extraction observer
 - **Duplex channel** — true streaming input, multiple simultaneous producers
 
-## Migration Path
+## Branching & Versioning
 
-1. Build SDK Next on the `sdk-next` branch (worktree: `/Pondside/Workshop/Projects/alpha_sdk-next`)
-2. **Clyde** — first real consumer, validates the generic SDK (Phase 2.5)
-3. `quack-next` — minimal CLI consumer
-4. Port Duckpond
-5. Port Solitude/Routines
-6. Merge to main as v2.0.0
-7. Existing consumers pin `>=1.0,<2.0` until ready to upgrade
+**Version history:** 0.x was the prototype SDK (still running in Basement on `tinkering`). We never published 1.0.0. The rewrite IS the 1.0.
 
-Current SDK stays running in `/Pondside/Basement/alpha_sdk/` (branch: tinkering). Nothing breaks during the build.
+**Branch topology:**
+- `main` — the plain SDK. Engine, session, queue, router, producers, observers. Eventually: memory machinery, soul loading, orientation assembly — all disabled-by-default infrastructure. Clyde consumes published releases from here.
+- `alpha` (future) — branches off `main`, carries Alpha-specific code: soul doc paths, Alpha-specific observers, Frobozz, Solitude producers. Merge from `main` (not rebase) to pick up infrastructure improvements.
+- `tinkering` — legacy v0.x code. Duckpond/Solitude/Routines still run on this in `/Pondside/Basement/alpha_sdk/`. Stays until those consumers port to v1.x.
 
-## Deployment Model
+**Forks for other personalities:**
+- Rosemary-SDK: fork of Alpha-SDK `main`. Merges upstream when ready.
+- House-SDK, others: same pattern.
 
-Same as v1.x: Pondsiders package index on GitHub Pages, semver, `uv` everywhere. The `.github/workflows/` action carries forward unchanged.
+**Versioning:** Semver. `1.0.0a1` = first alpha (plain SDK, mirepoix only). Bump alpha versions as infrastructure is added. `1.0.0` = the full SDK with all generic machinery. Alpha-specific releases may use a different scheme TBD.
+
+**Deployment:** Pondsiders package index on GitHub Pages, `uv` everywhere. `.github/workflows/` action publishes wheels on version tags.
 
 ## First Consumer: Clyde (Project M.O.O.S.E.)
 
@@ -225,11 +226,35 @@ Same as v1.x: Pondsiders package index on GitHub Pages, semver, `uv` everywhere.
 
 Clyde proves the SDK works before we layer on Alpha-specific complexity. If the broth tastes wrong, the mirepoix is wrong.
 
+### Clyde Architecture (designed Feb 28)
+
+**Frontend:** Copy Rosemary-App's 6 files with string swaps. assistant-ui + Zustand + Tailwind v4. Dark theme with ChatGPT green (`#10a37f`). Image attachment via `SimpleImageAttachmentAdapter` (base64 passthrough — no server-side storage). Drop file upload adapter.
+
+**Backend:** FastAPI serving built Vite static files + SSE streaming endpoint.
+- `client.py` — wraps `AlphaClient(model="haiku")`. Simpler than Rosemary's `GreenhouseClient` (no SDK preprocessing).
+- `routes/chat.py` — POST /api/chat → translates `AlphaClient.events()` to SSE (`AssistantEvent` → `text-delta`, `ResultEvent` → `session-id` + `done`).
+- `routes/sessions.py` — GET /api/sessions from Redis. GET /api/sessions/{id} from JSONL files.
+- `main.py` — FastAPI, Logfire, static serving, health check.
+
+**Persistence:** Bind mount to Pondside (`/Pondside/Workshop/Projects/Clyde/data/`).
+- `data/claude/` → mounted as `~/.claude` (session JSONL files)
+- `data/redis/` → Redis AOF persistence
+
+Inherits Syncthing (3 machines) + Restic (B2) backup automatically. 30-day natural expiry matches claude's session retention.
+
+**Docker:** Multi-stage Dockerfile (node builds Vite → python serves FastAPI). Redis Alpine sidecar with `--appendonly yes`. Port 8780 (or similar).
+
+**What Clyde doesn't have:** Neon, any SDK beyond AlphaClient, nights.py, summaries.py, upload route, context route, system prompt, memory, MCP tools.
+
+**Rosemary files reviewed Feb 28:** ~1,500 lines frontend, ~600 lines backend. Genuinely portable. Only real new code is the backend client wrapper and SSE translation layer.
+
 ## Session Design
 
-`engine.start(session_id=None) → str (UUID)`:
-- **No session_id:** spawn claude, discover ID from init handshake, return it
-- **With session_id:** read claude's JSONL transcript, emit replay events with `is_replay=True`, spawn claude with `--resume`, return ID as confirmation
+`engine.start(session_id=None)` — returns None, not a session ID:
+- **No session_id:** spawn claude. Session ID is `None` until first turn — arrives on `ResultEvent`.
+- **With session_id:** replay JSONL as events with `is_replay=True`, spawn claude with `--resume`.
+
+Wire protocol truth (confirmed Feb 28): claude emits **zero** session identity during init. One `control_response` with model/tools/servers. Session ID first appears on the first turn's `ResultEvent`. Every message after that carries it.
 
 Same pipe for replay and live. The consumer doesn't need two code paths. Events are events — some came from disk (fast), some from the subprocess (real-time). `is_replay` flag on every event lets consumers distinguish if they want to (batch-render history, skip animation) but they don't have to.
 
@@ -257,3 +282,8 @@ Granular progress tracking lives in [#22](https://github.com/Pondsiders/Alpha-SD
 | Feb 28, 2026 | `is_replay` flag on Event base class | Metadata is cheap to include and expensive to add later. |
 | Feb 28, 2026 | `start()` returns None, not session_id | Wire protocol confirmed: claude emits no session_id during init. It arrives on first turn's ResultEvent. Don't promise what you can't deliver. |
 | Feb 28, 2026 | Phase 2 complete — the mirepoix | queue.py, router.py, replay.py, session.py, client.py, producers/human.py. 166 tests, 0 failures. quack-next.py validates end-to-end. |
+| Feb 28, 2026 | Version is 1.0.0, not 2.0.0 | We never published 1.0.0. The 0.x series was prototype. The rewrite is the real 1.0. |
+| Feb 28, 2026 | Clyde is a separate project, not in-repo | Clyde is a real product (ChatGPT replacement), not a test harness. Pins to published SDK release. |
+| Feb 28, 2026 | `main` = plain SDK, `alpha` = personality branch | Optimize for freedom to tinker on Alpha without breaking downstream. Merge from main, not rebase. |
+| Feb 28, 2026 | "Thick main" — memory/soul/orientation machinery on `main` | Infrastructure is hippocampus, not personality. Disabled-by-default. Even Clyde has it, just doesn't enable it. |
+| Feb 28, 2026 | Forks for other personalities (Rosemary, House) | Fork `main`, merge upstream. No entanglement with Alpha-specific code. |
