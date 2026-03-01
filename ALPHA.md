@@ -142,15 +142,17 @@ The distinction: **engines** are stateful, long-running, identity-bearing. **Fun
 
 Words mean things. These got muddled in v1.x. Don't let it happen again.
 
-**System prompt** — Identity. Who I am. Soul doc + Bill of Rights, concatenated. Passed to `claude` at startup. **One per session.** Static. Never changes between compactions or turns. Assembled by `system_prompt/assemble.py`.
+**System prompt** — Identity. Who I am. Everything from **before today**: soul doc, Bill of Rights, here (client/weather), yesterday capsule, last night capsule, letter from last night. Concatenated into a **single flat string** and passed to `claude --system-prompt` at startup. **One per session.** Static. Never changes between compactions or turns. `system_prompt/assemble.py` returns named blocks (for Logfire observability) and a concatenated string (for claude). Claude prepends its own boilerplate ("You are a Claude agent...") — we can't control that.
 
-**Orientation prompt** — Context. Where and when I am. The first user message of every **context window** (session start or post-compaction). Contains: ALPHA.md files, capsules, events, todos, weather, memories. Assembled fresh each time by `orientation/assemble.py`. Dynamic — fetches data from APIs directly, no Redis cache.
+**Orientation prompt** — Context. What's happening **today and forward**. The first user message of every **context window** (session start or post-compaction). Contains: today so far, ALPHA.md files + hints, events, todos, continuation summary (post-compaction). Assembled fresh each time by `orientation/assemble.py` as an **array of content blocks**. Dynamic — fetches data from APIs directly, no Redis cache. ALPHA.md files go here (not system prompt) because we edit them during sessions.
+
+**Every-prompt** — This moment. Added to every user message: recalled memories, Intro speaks (suggest nudge), approach lights (context warnings), timestamp, user message. Assembled by `context.py`.
 
 **HUD** — Archaic. No longer a software concept. Used to be a dynamic system prompt component refreshed via Pulse/Redis. Phased out. Do not resurrect. The orientation prompt replaces this entirely.
 
 **Context window** — One continuous conversation before compaction. A session may contain multiple context windows (separated by compactions).
 
-**Turn** — One user message + one assistant response. Orientation fires on the first turn of each context window. Subsequent turns get only recall memories + suggest nudge + user message.
+**Turn** — One user message + one assistant response. Orientation fires on the first turn of each context window. Subsequent turns get only the every-prompt content.
 
 ## Protocol
 
@@ -179,6 +181,103 @@ The Engine manages all four. Channels 1-3 are direct subprocess pipes. Channel 4
 - **Sniffs usage headers** — Extracts `anthropic-ratelimit-unified-{7d,5h}-utilization` from Anthropic's response headers.
 
 The proxy is a private implementation detail of Engine — no other module imports or knows about it.
+
+## Prompt Architecture (Phase 3 Design, Mar 1 2026)
+
+Three bins, organized by **temporal frame**: before today, today and forward, this moment.
+
+### The Three Bins
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ SYSTEM PROMPT (before today)           One per claude session │
+│ Flat string → --system-prompt                                │
+│                                                              │
+│  Soul doc                                                    │
+│  Bill of Rights                                              │
+│  Here (client, weather at session start)                     │
+│  Yesterday capsule                                           │
+│  Last night capsule                                          │
+│  Letter from last night                                      │
+├──────────────────────────────────────────────────────────────┤
+│ ORIENTATION (today and forward)    One per context window     │
+│ Array of content blocks → first user message                 │
+│                                                              │
+│  Today so far                                                │
+│  ALPHA.md files (autoloaded)                                 │
+│  ALPHA.md hints (blocking requirements)                      │
+│  Events (calendar)                                           │
+│  Todos                                                       │
+│  Continuation summary (post-compaction only)                 │
+├──────────────────────────────────────────────────────────────┤
+│ EVERY-PROMPT (this moment)                   One per turn     │
+│ Array of content blocks → prepended to user message          │
+│                                                              │
+│  Recalled memories (0-5, semantic + keyword)                 │
+│  Intro speaks (suggest nudge from previous turn)             │
+│  Approach lights (context usage warnings)                    │
+│  Timestamp [Sent Sun Mar 1 2026, 9:04 AM]                   │
+│  User message                                                │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Why This Sort
+
+**System prompt = frozen history.** Yesterday is yesterday. Last night is last night. The soul doesn't change mid-session. These earn the identity-weight training signal (models treat system-marked content as "who I am") and are always cached (always the prefix). Changing requires restarting `claude` — acceptable because nothing here changes during a session.
+
+**Orientation = live context.** Today so far updates as the day progresses. ALPHA.md files get edited during build sessions. Todos get completed. Events get added. These need to be fetched fresh at each context window boundary (session start or post-compaction).
+
+**Every-prompt = ephemeral.** Memories are query-specific. Suggest nudges are turn-specific. Approach lights depend on current token count. Timestamp is per-message.
+
+### Implementation: system_prompt/assemble.py
+
+Returns **both** formats from the same data:
+- **Named blocks** — `[{"name": "soul", "text": "..."}, {"name": "yesterday", "text": "..."}]` — for Logfire `gen_ai.system_instructions` attribute (discrete expandable blocks in the UI)
+- **Flat string** — `"\n\n".join(...)` — for `claude --system-prompt` (which only accepts a plain string, confirmed by probe Mar 1)
+
+Claude prepends its own boilerplate blocks: a billing header and "You are a Claude agent, built on Anthropic's Claude Agent SDK." We can't remove these. Cache TTL is 1 hour (`ephemeral`).
+
+### Implementation: orientation/assemble.py
+
+Returns an **array of content blocks** (`[{"type": "text", "text": "..."}]`). Each component is a separate block. Fetches all data fresh (Postgres for capsules, filesystem for ALPHA.md, APIs for events/todos). No Redis cache.
+
+### Implementation: context.py
+
+The turn assembler. Two paths:
+
+```python
+def build_first_turn(orientation_blocks, recall_memories, timestamp, user_message):
+    """First turn of a context window: orientation + recall + timestamp + message."""
+    return orientation_blocks + recall_blocks + [timestamp_block, message_block]
+
+def build_turn(suggest_nudge, recall_memories, approach_light, timestamp, user_message):
+    """Subsequent turns: suggest + recall + approach + timestamp + message."""
+    blocks = []
+    if suggest_nudge: blocks.append(suggest_block)
+    blocks.extend(recall_blocks)
+    if approach_light: blocks.append(approach_block)
+    blocks.extend([timestamp_block, message_block])
+    return blocks
+```
+
+The session driver knows which to call (first turn = no prior turns in this context window).
+
+### Probe Results (Mar 1)
+
+- `--system-prompt` does **NOT** parse JSON — treats the entire string as literal text
+- `ARG_MAX` is 2MB; our system prompt is ~26K — plenty of room
+- Claude wraps our string in one content block and prepends two of its own
+- Cache control: `{"type": "ephemeral", "ttl": "1h"}` on all system blocks
+- First user message (orientation) has **no** `cache_control` — but gets prefix-cached anyway after the first turn
+- Claude puts `cache_control` on the last two messages (conversation frontier)
+
+### Testing Strategy
+
+From the golden file (`tests/golden/alpha_api_request_reference.json`, 2,256 lines):
+- Assert system prompt string contains soul doc, bill of rights, here, capsules
+- Assert first user message is an array of content blocks in the right order
+- Assert subsequent user messages have recall + suggest + timestamp + message
+- Use Iota (test fixture: minimal soul, seeded memories, mocked orientation) for integration tests
 
 ## What Carries Forward from v1.x
 
@@ -287,3 +386,9 @@ Granular progress tracking lives in [#22](https://github.com/Pondsiders/Alpha-SD
 | Feb 28, 2026 | `main` = plain SDK, `alpha` = personality branch | Optimize for freedom to tinker on Alpha without breaking downstream. Merge from main, not rebase. |
 | Feb 28, 2026 | "Thick main" — memory/soul/orientation machinery on `main` | Infrastructure is hippocampus, not personality. Disabled-by-default. Even Clyde has it, just doesn't enable it. |
 | Feb 28, 2026 | Forks for other personalities (Rosemary, House) | Fork `main`, merge upstream. No entanglement with Alpha-specific code. |
+| Mar 1, 2026 | Three temporal bins for prompt content | System prompt = before today, orientation = today+forward, every-prompt = this moment. Temporal frame, not functional grouping. |
+| Mar 1, 2026 | System prompt is a flat concatenated string | `--system-prompt` doesn't parse JSON. Probe confirmed. Named blocks for Logfire, flat string for claude. |
+| Mar 1, 2026 | ALPHA.md files in orientation, not system prompt | We edit these during sessions. Freshness > caching. |
+| Mar 1, 2026 | Drop current date from prompt | Redundant — timestamp on every message provides the date. |
+| Mar 1, 2026 | Cache TTL is 1 hour | Confirmed from golden file: `{"type": "ephemeral", "ttl": "1h"}` on system blocks. |
+| Mar 1, 2026 | Claude prepends its own boilerplate | Billing header + "You are a Claude agent..." — can't remove, don't try. |
