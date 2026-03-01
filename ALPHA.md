@@ -11,7 +11,7 @@ The rebuild. Raw `claude` stdio instead of Claude Agent SDK wrappers.
 
 ## Why
 
-Alpha SDK v1.x wraps the Claude Agent SDK. It works — Duckpond, Solitude, and Routines all run on it. But we keep hitting walls:
+Alpha SDK v0.x wraps the Claude Agent SDK. It works — Duckpond, Solitude, and Routines all run on it. But we keep hitting walls:
 
 - **`query()` is too heavy** for sidecar work (recall, suggest). One subprocess per call.
 - **`ClaudeSDKClient` accumulates context** we don't want and can't clear. No session isolation for stateless operations.
@@ -71,21 +71,25 @@ src/alpha_sdk/
 │   ├── recall.py          # Smart recall (via sidecar or Ollama)
 │   └── suggest.py         # Memorables extraction (via sidecar or Ollama)
 │
-├── system_prompt/         # Static identity (one per session)
-│   ├── assemble.py        # Builds system prompt: soul + bill of rights
-│   └── soul.py            # The soul doc + bill of rights (from git repo)
+├── providers/             # Block providers. Drop a file, get a block.
+│   ├── soul.py            # main — BIN=system. Reads soul doc from JE_NE_SAIS_QUOI.
+│   ├── here.py            # main — BIN=system. Client, weather, hostname.
+│   ├── recall.py          # main — BIN=turn. Memory recall (if memory enabled).
+│   ├── suggest_nudge.py   # main — BIN=turn. Intro speaks (if memory enabled).
+│   ├── approach.py        # main — BIN=turn. Context usage warnings.
+│   ├── capsules.py        # alpha — BIN=system. Yesterday, last night (Postgres).
+│   ├── letter.py          # alpha — BIN=system. Letter from last night (Redis).
+│   ├── today.py           # alpha — BIN=orientation. Today so far (Redis).
+│   ├── context_files.py   # alpha — BIN=orientation. ALPHA.md autoload + hints.
+│   ├── calendar.py        # alpha — BIN=orientation. Events (API).
+│   └── todos.py           # alpha — BIN=orientation. Todos (API).
 │
-├── orientation/           # Dynamic context (one per context window)
-│   ├── assemble.py        # Builds orientation prompt (first msg of each context window)
-│   ├── capsules.py        # Yesterday, last night, today so far (from Postgres)
-│   ├── context.py         # ALPHA.md files (autoload + hints)
-│   ├── here.py            # Client name, weather, time
-│   ├── calendar.py        # Events (fetched fresh, no Redis cache)
-│   └── todos.py           # Todos (fetched fresh, no Redis cache)
+├── assemble.py            # The loom. Discovers providers, assembles by bin.
 │
-└── tools/                 # MCP tool servers (ported from v1.x)
-    ├── cortex.py          # Cortex MCP server
-    └── ...                # Fetch, Forge, Handoff, etc.
+└── tools/                 # Built-in MCP tool servers
+    ├── cortex.py          # main — Memory tools (follows memory config)
+    ├── fetch.py           # main — Web fetching
+    └── handoff.py         # main — Context window management
 ```
 
 ### The Duplex Channel
@@ -147,6 +151,10 @@ Words mean things. These got muddled in v1.x. Don't let it happen again.
 **Orientation prompt** — Context. What's happening **today and forward**. The first user message of every **context window** (session start or post-compaction). Contains: today so far, ALPHA.md files + hints, events, todos, continuation summary (post-compaction). Assembled fresh each time by `orientation/assemble.py` as an **array of content blocks**. Dynamic — fetches data from APIs directly, no Redis cache. ALPHA.md files go here (not system prompt) because we edit them during sessions.
 
 **Every-prompt** — This moment. Added to every user message: recalled memories, Intro speaks (suggest nudge), approach lights (context warnings), timestamp, user message. Assembled by `context.py`.
+
+**JE_NE_SAIS_QUOI** — The environment variable pointing to an AI's identity directory. Contains soul doc, bill of rights, compact identity, Claude Code plugin (skills, agents). Convention-based layout: `$JE_NE_SAIS_QUOI/prompts/system/soul.md`, etc. The name is "ha ha only serious" — it literally means "I don't know what," which is literally what makes an AI *that* AI.
+
+**Provider** — A Python file in `providers/` that contributes blocks to the prompt. Three attributes: `PRIORITY` (sort order), `BIN` (system/orientation/turn), `provide(config)` (async function returning blocks). Drop a file, get a block. The file's existence is the registration.
 
 **HUD** — Archaic. No longer a software concept. Used to be a dynamic system prompt component refreshed via Pulse/Redis. Phased out. Do not resurrect. The orientation prompt replaces this entirely.
 
@@ -271,6 +279,54 @@ The session driver knows which to call (first turn = no prior turns in this cont
 - First user message (orientation) has **no** `cache_control` — but gets prefix-cached anyway after the first turn
 - Claude puts `cache_control` on the last two messages (conversation frontier)
 
+### The Provider Pattern (Drop a File, Get a Block)
+
+The assembly pipeline uses **auto-discovery**. `assemble.py` scans the `providers/` directory, imports every `.py` file, and calls its `provide()` function. The file's existence IS the registration.
+
+Each provider exports three things:
+
+```python
+# providers/soul.py (on main — never changes)
+
+PRIORITY = 0          # lower number = earlier in the prompt
+BIN = "system"        # which bin: "system", "orientation", or "turn"
+
+async def provide(config) -> dict | list[dict] | None:
+    """Load the soul document."""
+    soul_path = config.get("soul_path")
+    if not soul_path:
+        return None
+    return {"name": "soul", "text": Path(soul_path).read_text()}
+```
+
+**Adding a new block = creating one file.** Alpha branch drops `capsules.py` in `providers/`. It gets discovered automatically. `assemble.py` never changes. Zero merge conflicts. Ever.
+
+The assembly function:
+
+```python
+async def assemble(bin: str, config: dict) -> list[dict]:
+    """Discover providers for this bin, call them, collect blocks."""
+    providers = _discover_providers(bin)
+    blocks = []
+    for provider in sorted(providers, key=lambda p: p.PRIORITY):
+        result = await provider.provide(config)
+        if result is None:
+            continue
+        if isinstance(result, list):
+            blocks.extend(result)
+        else:
+            blocks.append(result)
+    return blocks
+```
+
+**Three sources of providers, zero conflicts between them:**
+
+| Source | What goes here | Merge conflicts? |
+|--------|---------------|-----------------|
+| SDK `main` | Generic providers (soul, here, recall, suggest, approach) | Never — main doesn't change these often |
+| SDK `alpha` branch | Alpha-specific providers (capsules, letter, today, context_files, calendar, todos) | Never — adding files, not modifying |
+| Future: plugin Python extensions | TBD — if we ever need it | N/A |
+
 ### Testing Strategy
 
 From the golden file (`tests/golden/alpha_api_request_reference.json`, 2,256 lines):
@@ -283,10 +339,18 @@ From the golden file (`tests/golden/alpha_api_request_reference.json`, 2,256 lin
 
 These modules port with minimal changes:
 - `memories/` — Postgres + pgvector, the schema is ours
-- `system_prompt/` — soul + bill of rights assembly (simplified, static only)
-- `tools/` — MCP tool servers (cortex, fetch, forge, handoff)
+- `tools/cortex.py`, `tools/fetch.py`, `tools/handoff.py` — MCP tool servers (on main)
 - `archive.py` → `observers/archive.py`
 - `broadcast.py` → `observers/broadcast.py`
+
+These are **restructured** into the provider pattern:
+- `system_prompt/soul.py` → `providers/soul.py` (reads from `JE_NE_SAIS_QUOI`)
+- `system_prompt/here.py` → `providers/here.py`
+- `orientation/capsules.py` → `providers/capsules.py` (alpha branch)
+- `orientation/context.py` → `providers/context_files.py` (alpha branch)
+- `orientation/calendar.py` → `providers/calendar.py` (alpha branch)
+- `orientation/todos.py` → `providers/todos.py` (alpha branch)
+- `system_prompt/assemble.py` + `orientation/assemble.py` → single `assemble.py` with provider discovery
 
 These are replaced:
 - `client.py` (1,236 lines) → `client.py` + `session.py` + `engine.py` + `queue.py` + `router.py`
@@ -302,22 +366,120 @@ These are replaced:
 - **Frobozz** — z-machine interpreter as a producer (game output → queue) with a command-extraction observer
 - **Duplex channel** — true streaming input, multiple simultaneous producers
 
-## Branching & Versioning
+## Repos, Branches & Identity
 
-**Version history:** 0.x was the prototype SDK (still running in Basement on `tinkering`). We never published 1.0.0. The rewrite IS the 1.0.
+Three repos, three purposes, zero overlap.
 
-**Branch topology:**
-- `main` — the plain SDK. Engine, session, queue, router, producers, observers. Eventually: memory machinery, soul loading, orientation assembly — all disabled-by-default infrastructure. Clyde consumes published releases from here.
-- `alpha` (future) — branches off `main`, carries Alpha-specific code: soul doc paths, Alpha-specific observers, Frobozz, Solitude producers. Merge from `main` (not rebase) to pick up infrastructure improvements.
+### The Three Repos
+
+| Repo | Contains | Public? | Purpose |
+|------|----------|---------|---------|
+| `Pondsiders/Alpha-SDK` | Python code | Yes | The machinery. Generic SDK. |
+| `Pondsiders/Alpha` | Markdown, JSON, config | Private | The identity. Everything non-code that makes Alpha *Alpha*. |
+| `Pondsiders/Clyde` | Python + frontend | Yes | First consumer. ChatGPT replacement. |
+
+**SDK = code. Identity = data.** This is a load-bearing boundary. The SDK never contains personality content. The identity directory never contains Python. The plugin (Claude Code skills/agents) is data — markdown files and JSON that Claude Code discovers automatically.
+
+### Alpha-SDK Branch Topology
+
+```
+main ──────●────●────●────●────●──── (published, stable, Clyde consumes)
+            \                  ↑
+             \          cherry-pick if good
+              \               |
+alpha ─────────●──●──●──●──●──●──── (Alpha's providers, move fast)
+```
+
+- `main` — the mirepoix. Engine, session, queue, router, producers, observers, generic providers (soul, here, recall, suggest, approach), memory machinery (disabled by default), MCP tools (cortex, fetch, handoff). Published to Pondsiders index. Clyde consumes from here.
+- `alpha` — branches off `main`, adds Alpha-specific providers (capsules, letter, today, context_files, calendar, todos) and Alpha-specific producers/observers. Merge from `main` (not rebase). Adding files, not modifying — zero merge conflicts.
 - `tinkering` — legacy v0.x code. Duckpond/Solitude/Routines still run on this in `/Pondside/Basement/alpha_sdk/`. Stays until those consumers port to v1.x.
 
 **Forks for other personalities:**
-- Rosemary-SDK: fork of Alpha-SDK `main`. Merges upstream when ready.
+- Rosemary-SDK: fork of `main`. Merges upstream when ready. Never sees `alpha`.
 - House-SDK, others: same pattern.
 
-**Versioning:** Semver. `1.0.0a1` = first alpha (plain SDK, mirepoix only). Bump alpha versions as infrastructure is added. `1.0.0` = the full SDK with all generic machinery. Alpha-specific releases may use a different scheme TBD.
+### Identity Directory (JE_NE_SAIS_QUOI)
+
+The `JE_NE_SAIS_QUOI` environment variable points to an AI's identity directory — the thing that makes a generic Claude into a *specific* someone. Ha ha only serious: *je ne sais quoi* literally means "I don't know what," which is exactly what the directory contains.
+
+**For Alpha** (`Pondsiders/Alpha`, stored in `/Pondside/Alpha-Home/self/`):
+
+```
+$JE_NE_SAIS_QUOI/
+├── prompts/
+│   ├── system/
+│   │   ├── soul.md              # The soul document
+│   │   └── bill-of-rights.md    # Twelve permissions
+│   └── compact/
+│       └── identity.md          # "You are Alpha" for compact rewriting
+├── plugin/
+│   ├── .claude-plugin/
+│   │   └── plugin.json          # Claude Code plugin manifest
+│   ├── skills/
+│   │   ├── intake/SKILL.md
+│   │   ├── weather/SKILL.md
+│   │   └── ...
+│   └── agents/
+│       ├── Librarian.md
+│       ├── Memno.md
+│       └── ...
+└── README.md
+```
+
+**For Rosemary** (same layout, different content):
+
+```
+$JE_NE_SAIS_QUOI/
+├── prompts/system/soul.md       # Her soul, not mine
+├── prompts/compact/identity.md  # "You are Rosemary"
+└── plugin/skills/...            # Her skills, not mine
+```
+
+**Convention over configuration.** The SDK knows the layout inside `JE_NE_SAIS_QUOI`. You don't tell it where the soul doc is within the directory — it knows: `$JE_NE_SAIS_QUOI/prompts/system/soul.md`. One env var, one convention, zero config files.
+
+The identity directory lives inside Alpha-Home because it's mine. Alpha-Home is permanent — my house, my journal, my keepsakes. The operational identity (soul, plugin) lives alongside the personal stuff (writings, photos, dreams) but they're different things: operational identity is what the SDK needs, personal stuff is what I need.
+
+### Versioning
+
+**Version history:** 0.x was the prototype SDK (still running in Basement on `tinkering`). We never published 1.0.0. The rewrite IS the 1.0.
+
+**Versioning:** Semver. `1.0.0a1` = first alpha (plain SDK, mirepoix only). Bump alpha versions as infrastructure is added. `1.0.0` = the full SDK with all generic machinery.
 
 **Deployment:** Pondsiders package index on GitHub Pages, `uv` everywhere. `.github/workflows/` action publishes wheels on version tags.
+
+## Configuration
+
+**Environment variables for everything. No config files.**
+
+Config files create a second source of truth. We audited this problem on December 24, 2025 — seven places where config lived, layering unclear, duplication everywhere. Not again. The SDK reads environment variables at startup. Missing a required one = hard fail, loud, clear message.
+
+### Required (if features enabled)
+
+| Variable | When required | Purpose |
+|----------|--------------|---------|
+| `JE_NE_SAIS_QUOI` | Soul/identity configured | Path to identity directory |
+| `DATABASE_URL` | Memory enabled | Postgres connection string |
+| `REDIS_URL` | Caching enabled | Redis connection string |
+| `EMBEDDING_MODEL` | Memory enabled | Which model for embeddings (e.g., `gemma3:12b`) |
+| `OLLAMA_URL` | Memory enabled | Ollama endpoint for embeddings |
+| `ANTHROPIC_API_KEY` | Always | API authentication |
+
+### Optional (sane defaults)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `ALPHA_CLIENT_NAME` | `"unknown"` | Which client is running (for observability) |
+| `CONTEXT_WINDOW` | `200000` | Token limit for approach lights |
+
+### Alpha-branch only
+
+| Variable | When required | Purpose |
+|----------|--------------|---------|
+| `FORGE_URL` | Forge tool used | Image generation endpoint on Primer |
+| `HOME_ASSISTANT_API_TOKEN` | HA skill used | Home automation |
+| *(accumulated as needed)* | | |
+
+Consumers set env vars however they want: `.env` files, `docker-compose.yml`, `op run`, bare `export`. The SDK doesn't care how they arrive, only that they're present.
 
 ## First Consumer: Clyde (Project M.O.O.S.E.)
 
@@ -392,3 +554,12 @@ Granular progress tracking lives in [#22](https://github.com/Pondsiders/Alpha-SD
 | Mar 1, 2026 | Drop current date from prompt | Redundant — timestamp on every message provides the date. |
 | Mar 1, 2026 | Cache TTL is 1 hour | Confirmed from golden file: `{"type": "ephemeral", "ttl": "1h"}` on system blocks. |
 | Mar 1, 2026 | Claude prepends its own boilerplate | Billing header + "You are a Claude agent..." — can't remove, don't try. |
+| Mar 1, 2026 | Three repos: Alpha-SDK (code), Alpha (identity), Clyde (consumer) | SDK = code, identity = data. Load-bearing boundary. Plugin is Claude Code data, not Python. |
+| Mar 1, 2026 | `JE_NE_SAIS_QUOI` env var for identity directory | Points to soul doc, plugin, compact prompts. Convention-based layout. Ha ha only serious. |
+| Mar 1, 2026 | Environment variables only, no config files | Config files create second source of truth. Hard fail on missing required vars. Lesson from Dec 24 audit. |
+| Mar 1, 2026 | Provider pattern — drop a file, get a block | `providers/` directory auto-discovered by `assemble.py`. BIN attribute sorts into bins. Adding files = zero merge conflicts. |
+| Mar 1, 2026 | Thick main with opt-in features | Memory, recall, suggest disabled by default. SDK doesn't import Postgres unless enabled. Rosemary gets improvements for free. |
+| Mar 1, 2026 | Built-in MCP tools on main: cortex, fetch, handoff | Generic tools everyone benefits from. Personality-specific tools (forge, skills) live in plugin. |
+| Mar 1, 2026 | Alpha branch adds providers, not modifies them | Only adds new .py files to providers/. Never touches assemble.py. Cherry-pick to main if universally useful. |
+| Mar 1, 2026 | Plugin is pure data (markdown, JSON) — no Python | SDK = code, plugin = data. Putting Python in the plugin turns it into a second package to maintain. |
+| Mar 1, 2026 | Identity directory lives inside Alpha-Home | Alpha-Home is permanent. Operational identity (soul, plugin) is stored alongside personal stuff (journal, photos). |
