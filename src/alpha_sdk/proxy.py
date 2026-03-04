@@ -11,8 +11,13 @@ No other module should import this directly.
 
 The proxy sits between claude and Anthropic's API. It:
 - Rewrites compact requests (three-phase surgical intervention)
-- Counts tokens (fire-and-forget echo to /v1/messages/count_tokens)
+- Sniffs input_tokens from streaming response SSE events (message_start)
 - Sniffs usage quota headers from responses
+
+Token counting works by parsing the Anthropic SSE stream in-flight.
+Every streaming response starts with a message_start event containing
+usage.input_tokens — the total prompt size. We extract this as the
+response flows through, zero extra API calls, zero extra latency.
 
 The compact rewriting logic is ported from v1.x compact_proxy.py.
 Detection signatures are constants (what claude sends).
@@ -442,10 +447,6 @@ class _Proxy:
         if "content-type" not in headers:
             headers["content-type"] = "application/json"
 
-        # Token counting: fire-and-forget on /v1/messages requests
-        if body is not None and path == "/v1/messages":
-            asyncio.create_task(self._count_tokens(body, headers))
-
         # Forward to Anthropic
         url = f"{ANTHROPIC_API_URL}{path}"
 
@@ -474,12 +475,66 @@ class _Proxy:
                     resp.headers[key] = value
 
             await resp.prepare(request)
+
+            # Sniff SSE stream for usage info while forwarding.
+            # message_start is always the first event — once found, stop scanning.
+            sse_buffer = ""
+            usage_found = False
+
             async for chunk in response.aiter_bytes():
                 await resp.write(chunk)
+
+                if not usage_found:
+                    sse_buffer += chunk.decode("utf-8", errors="replace")
+                    tokens = self._extract_usage_from_sse(sse_buffer)
+                    if tokens is not None:
+                        self._token_count = tokens  # Direct set (not high-water — must drop after compact)
+                        usage_found = True
+                        sse_buffer = ""  # Free the buffer
+
             await resp.write_eof()
             return resp
 
-    # -- Token counting -------------------------------------------------------
+    # -- SSE usage extraction -------------------------------------------------
+
+    @staticmethod
+    def _extract_usage_from_sse(buffer: str) -> int | None:
+        """Extract total input tokens from a message_start SSE event.
+
+        Scans an accumulated SSE buffer for the message_start event
+        and returns the total input token count — including cached tokens.
+
+        The message_start event is always the first event in a streaming
+        response. Its data payload contains three token counts:
+            input_tokens              — non-cached (cache miss) tokens
+            cache_creation_input_tokens — tokens written to cache this request
+            cache_read_input_tokens    — tokens served from cache
+
+        All three contribute to context window usage. Caching is a billing
+        and latency optimization — it doesn't reduce how much of the window
+        is occupied. A cached 18k system prompt still uses 18k of context.
+        """
+        for line in buffer.split("\n"):
+            if not line.startswith("data: "):
+                continue
+            try:
+                payload = json.loads(line[6:])  # Skip "data: " prefix
+                if payload.get("type") == "message_start":
+                    usage = payload.get("message", {}).get("usage", {})
+                    return (
+                        usage.get("input_tokens", 0)
+                        + usage.get("cache_creation_input_tokens", 0)
+                        + usage.get("cache_read_input_tokens", 0)
+                    )
+            except (json.JSONDecodeError, ValueError):
+                continue
+        return None
+
+    # -- Token counting (DEPRECATED — kept for reference) ---------------------
+    # Replaced by _extract_usage_from_sse above. The fire-and-forget approach
+    # required a separate API key and a separate API call per turn. The SSE
+    # sniffing approach gets real numbers from the actual response stream
+    # with zero extra API calls.
 
     async def _count_tokens(self, body: dict, headers: dict) -> None:
         """Count tokens via fire-and-forget to /v1/messages/count_tokens.

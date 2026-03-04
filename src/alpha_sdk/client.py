@@ -92,6 +92,16 @@ class AlphaClient:
         """Current session ID."""
         return self._session.session_id
 
+    @property
+    def token_count(self) -> int:
+        """Current input token count from the proxy's SSE sniffing."""
+        return self._engine.token_count
+
+    @property
+    def context_window(self) -> int:
+        """Context window size for the model."""
+        return self._engine.context_window
+
     async def start(self, session_id: str | None = None) -> None:
         """Start the client — engine, replay, driver.
 
