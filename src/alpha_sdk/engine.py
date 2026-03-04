@@ -320,7 +320,13 @@ class Engine:
         try:
             # Start the HTTP proxy BEFORE spawning claude so
             # ANTHROPIC_BASE_URL is set when the subprocess starts.
-            self._proxy = _Proxy(compact_config=self.compact_config)
+            # Capture the original upstream URL first — this is where the proxy
+            # forwards requests to (Anthropic, or a test fixture).
+            upstream_url = os.environ.get("ANTHROPIC_BASE_URL")
+            self._proxy = _Proxy(
+                compact_config=self.compact_config,
+                upstream_url=upstream_url,
+            )
             await self._proxy.start()
 
             self._proc = await self._spawn()

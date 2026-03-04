@@ -7,7 +7,7 @@ from alpha_sdk import __version__
 
 def test_version():
     """Package version matches pyproject.toml."""
-    assert __version__ == "1.0.0a5"
+    assert __version__ == "1.0.0a6"
 
 
 def test_fixtures_load(sample_init_response, sample_assistant_message, sample_result):

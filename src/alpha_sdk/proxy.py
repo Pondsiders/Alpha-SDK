@@ -315,9 +315,11 @@ class _Proxy:
         self,
         compact_config: CompactConfig | None = None,
         context_window: int = DEFAULT_CONTEXT_WINDOW,
+        upstream_url: str | None = None,
     ):
         self._compact_config = compact_config
         self._context_window = context_window
+        self._upstream_url = upstream_url or ANTHROPIC_API_URL
 
         self._port: int | None = None
         self._app: web.Application | None = None
@@ -447,8 +449,8 @@ class _Proxy:
         if "content-type" not in headers:
             headers["content-type"] = "application/json"
 
-        # Forward to Anthropic
-        url = f"{ANTHROPIC_API_URL}{path}"
+        # Forward to upstream (Anthropic, or a test fixture if configured)
+        url = f"{self._upstream_url}{path}"
 
         if self._http_client is None:
             raise RuntimeError("HTTP client not initialized")
@@ -579,7 +581,7 @@ class _Proxy:
                 count_body["tools"] = cleaned
 
             response = await self._http_client.post(
-                f"{ANTHROPIC_API_URL}/v1/messages/count_tokens",
+                f"{self._upstream_url}/v1/messages/count_tokens",
                 content=json.dumps(count_body).encode(),
                 headers=count_headers,
                 timeout=10.0,
