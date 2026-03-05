@@ -1,27 +1,20 @@
-"""engine.py — The claude subprocess. All four I/O channels.
+"""claude.py — The Claude class. One subprocess, four I/O channels.
 
-Based on the protocol observed in quack-raw.py and quack-wire.py
-(Feb 26, 2026). The claude binary communicates via newline-delimited
-JSON on stdin/stdout, and makes API requests via ANTHROPIC_BASE_URL.
-
-The Engine manages all four channels:
-  1. stdin  — JSON messages in
-  2. stdout — JSON events out
-  3. stderr — diagnostic output (drained in background)
-  4. HTTP   — API requests (intercepted by proxy for compact rewriting)
+The only stateful object in the SDK. Wraps the claude binary over
+newline-delimited JSON stdio, with an HTTP proxy for compact rewriting
+and token counting.
 
 Usage:
-    engine = Engine(model="claude-sonnet-4-20250514")
-    await engine.start()            # New session
-    await engine.start("abc-123")   # Resume session
-    # engine.session_id is None until first turn completes
-    await engine.send("Hello!")
-    async for event in engine.events():
+    claude = Claude(system_prompt="You are a frog.")
+    await claude.start()            # New session
+    await claude.start("abc-123")   # Resume session
+    await claude.send([{"type": "text", "text": "Hello!"}])
+    async for event in claude.events():
         if isinstance(event, AssistantEvent):
             print(event.text)
         elif isinstance(event, ResultEvent):
             break
-    await engine.stop()
+    await claude.stop()
 """
 
 from __future__ import annotations
@@ -38,12 +31,7 @@ from .proxy import CompactConfig, _Proxy
 
 
 def _bundled_claude_path() -> str:
-    """Resolve the claude binary bundled inside claude-agent-sdk.
-
-    This is the ONLY way we find claude. No PATH lookup, no fallback
-    locations. If claude-agent-sdk isn't installed or the binary is
-    missing, we fail loud and clear.
-    """
+    """Resolve the claude binary bundled inside claude-agent-sdk."""
     try:
         import claude_agent_sdk._bundled as _bundled
     except ImportError:
@@ -53,8 +41,6 @@ def _bundled_claude_path() -> str:
             "check that your environment has the right dependencies."
         )
 
-    # _bundled is a namespace package — __file__ is None, but
-    # __path__ has the directory. Use the first (only) path entry.
     bundled_dir = Path(_bundled.__path__[0])
     binary = bundled_dir / "claude"
 
@@ -70,7 +56,7 @@ def _bundled_claude_path() -> str:
 # -- State machine ------------------------------------------------------------
 
 
-class EngineState(Enum):
+class ClaudeState(Enum):
     """Lifecycle states for the claude subprocess."""
 
     IDLE = auto()      # Not started
@@ -80,8 +66,6 @@ class EngineState(Enum):
 
 
 # -- Events -------------------------------------------------------------------
-# Parsed JSON messages from claude's stdout.
-# The engine yields these; the router dispatches them.
 
 
 @dataclass
@@ -103,19 +87,12 @@ class InitEvent(Event):
 
 @dataclass
 class UserEvent(Event):
-    """User message — content blocks from the user.
-
-    Content blocks follow the Messages API format:
-    [{"type": "text", "text": "..."}, {"type": "image", "source": {...}}, ...]
-
-    Only emitted during replay. Live user messages are sent, not received.
-    """
+    """User message — content blocks. Only emitted during replay."""
 
     content: list = field(default_factory=list)
 
     @property
     def text(self) -> str:
-        """Extract concatenated text from content blocks."""
         return "".join(
             block.get("text", "")
             for block in self.content
@@ -125,17 +102,12 @@ class UserEvent(Event):
 
 @dataclass
 class AssistantEvent(Event):
-    """Assistant response — contains content blocks.
-
-    Content blocks follow the Messages API format:
-    [{"type": "text", "text": "..."}, {"type": "tool_use", ...}, ...]
-    """
+    """Assistant response — content blocks."""
 
     content: list = field(default_factory=list)
 
     @property
     def text(self) -> str:
-        """Extract concatenated text from content blocks."""
         return "".join(
             block.get("text", "")
             for block in self.content
@@ -163,52 +135,39 @@ class SystemEvent(Event):
 
 @dataclass
 class ErrorEvent(Event):
-    """Error from the engine (process death, parse failure, etc.)."""
+    """Error from claude (process death, parse failure, etc.)."""
 
     message: str = ""
 
 
 @dataclass
 class StreamEvent(Event):
-    """Streaming delta from claude (with --include-partial-messages).
+    """Streaming delta — Messages API format wrapped by claude.
 
-    Wraps the Anthropic Messages API streaming format:
-    - content_block_start: new block beginning (text, thinking, tool_use)
-    - content_block_delta: incremental chunk (text_delta, thinking_delta)
-    - content_block_stop: block complete
-    - message_start, message_delta, message_stop: message-level events
-
-    These arrive BEFORE the complete AssistantEvent for the same content.
-    Consumers that want streaming use these; consumers that don't can
-    ignore them and use AssistantEvent as before.
+    Arrives BEFORE the complete AssistantEvent for the same content.
     """
 
     inner: dict = field(default_factory=dict)
 
     @property
     def event_type(self) -> str:
-        """Inner event type: content_block_start, content_block_delta, etc."""
         return self.inner.get("type", "")
 
     @property
     def index(self) -> int:
-        """Content block index (0-based)."""
         return self.inner.get("index", 0)
 
     @property
     def delta_type(self) -> str:
-        """Delta type: text_delta, thinking_delta, input_json_delta, etc."""
         return self.inner.get("delta", {}).get("type", "")
 
     @property
     def delta_text(self) -> str:
-        """Extract text from text_delta or thinking_delta."""
         delta = self.inner.get("delta", {})
         return delta.get("text", "") or delta.get("thinking", "")
 
     @property
     def block_type(self) -> str:
-        """Block type from content_block_start events."""
         return self.inner.get("content_block", {}).get("type", "")
 
 
@@ -222,19 +181,19 @@ class _ControlRequestEvent(Event):
     request: dict = field(default_factory=dict)
 
 
-# -- Engine -------------------------------------------------------------------
+# -- Claude -------------------------------------------------------------------
 
 
-class Engine:
-    """Manages a claude subprocess over JSON stdio + HTTP proxy.
+class Claude:
+    """A claude subprocess. The only stateful object in the SDK.
 
-    The engine handles all four I/O channels:
+    Manages four I/O channels:
     - stdin/stdout: JSON message framing
     - stderr: background drain
     - HTTP: localhost proxy for compact rewriting + token counting
 
-    The engine does NOT interpret events — that's the router's job.
-    It yields parsed Event objects and lets consumers decide what to do.
+    Simple API: start(), send(), events(), stop().
+    No queues, no routers, no sessions — just the subprocess.
     """
 
     def __init__(
@@ -243,24 +202,22 @@ class Engine:
         system_prompt: str | None = None,
         mcp_config: str | None = None,
         permission_mode: str = "bypassPermissions",
-        extra_args: list[str] | None = None,
         compact_config: CompactConfig | None = None,
     ):
         self.model = model
         self.system_prompt = system_prompt
         self.mcp_config = mcp_config
         self.permission_mode = permission_mode
-        self.extra_args = extra_args or []
         self.compact_config = compact_config
 
-        self._state = EngineState.IDLE
+        self._state = ClaudeState.IDLE
         self._proc: asyncio.subprocess.Process | None = None
         self._stderr_task: asyncio.Task | None = None
         self._proxy: _Proxy | None = None
         self._session_id: str | None = None
 
     @property
-    def state(self) -> EngineState:
+    def state(self) -> ClaudeState:
         return self._state
 
     @property
@@ -272,7 +229,7 @@ class Engine:
     def pid(self) -> int | None:
         return self._proc.pid if self._proc else None
 
-    # -- Proxy properties (delegates to _proxy) -------------------------------
+    # -- Proxy delegates ------------------------------------------------------
 
     @property
     def token_count(self) -> int:
@@ -286,12 +243,10 @@ class Engine:
 
     @property
     def usage_7d(self) -> float | None:
-        """7-day usage quota (0.0-1.0) from Anthropic response headers."""
         return self._proxy.usage_7d if self._proxy else None
 
     @property
     def usage_5h(self) -> float | None:
-        """5-hour usage quota (0.0-1.0) from Anthropic response headers."""
         return self._proxy.usage_5h if self._proxy else None
 
     def reset_token_count(self) -> None:
@@ -305,23 +260,15 @@ class Engine:
         """Spawn claude and perform the init handshake.
 
         Args:
-            session_id: If provided, resume this session (adds --resume flag).
-                        If None, start a new session.
-
-        The session ID is not known until the first turn completes.
-        After the first turn, read it from engine.session_id.
+            session_id: Resume this session, or None for a new session.
         """
-        if self._state != EngineState.IDLE:
-            raise RuntimeError(f"Cannot start engine in state {self._state}")
+        if self._state != ClaudeState.IDLE:
+            raise RuntimeError(f"Cannot start in state {self._state}")
 
-        self._state = EngineState.STARTING
-        self._session_id = session_id  # Known for resume, None for new
+        self._state = ClaudeState.STARTING
+        self._session_id = session_id
 
         try:
-            # Start the HTTP proxy BEFORE spawning claude so
-            # ANTHROPIC_BASE_URL is set when the subprocess starts.
-            # Capture the original upstream URL first — this is where the proxy
-            # forwards requests to (Anthropic, or a test fixture).
             upstream_url = os.environ.get("ANTHROPIC_BASE_URL")
             self._proxy = _Proxy(
                 compact_config=self.compact_config,
@@ -332,9 +279,9 @@ class Engine:
             self._proc = await self._spawn()
             self._stderr_task = asyncio.create_task(self._drain_stderr())
             await self._init_handshake()
-            self._state = EngineState.READY
+            self._state = ClaudeState.READY
         except Exception:
-            self._state = EngineState.STOPPED
+            self._state = ClaudeState.STOPPED
             await self._cleanup()
             raise
 
@@ -342,15 +289,9 @@ class Engine:
         """Send a user message to claude.
 
         Args:
-            content: Messages API content blocks, e.g.
-                [{"type": "text", "text": "Hello!"}]
-                or multimodal:
-                [{"type": "text", "text": "What's this?"},
-                 {"type": "image", "source": {"type": "base64", ...}}]
-
-        The message is queued on stdin. Call events() to read the response.
+            content: Messages API content blocks.
         """
-        if self._state != EngineState.READY:
+        if self._state != ClaudeState.READY:
             raise RuntimeError(f"Cannot send in state {self._state}")
 
         await self._send_json(self._format_user_message(content))
@@ -358,31 +299,26 @@ class Engine:
     async def events(self) -> AsyncIterator[Event]:
         """Yield events from claude's response stream.
 
-        Reads until a ResultEvent (end of turn). Automatically handles
-        permission requests by approving them — consumers never see
-        control_request events.
-
-        Yields: AssistantEvent, SystemEvent, ResultEvent, ErrorEvent.
+        Reads until a ResultEvent (end of turn). Auto-approves
+        permission requests — consumers never see them.
         """
-        if self._state != EngineState.READY:
+        if self._state != ClaudeState.READY:
             raise RuntimeError(f"Cannot read events in state {self._state}")
 
         while True:
             raw = await self._read_json()
 
             if raw is None:
-                self._state = EngineState.STOPPED
+                self._state = ClaudeState.STOPPED
                 yield ErrorEvent(raw={}, message="claude process exited unexpectedly")
                 return
 
             event = self._parse_event(raw)
 
             if isinstance(event, _ControlRequestEvent):
-                # Auto-approve and continue — don't yield to consumer
                 await self._send_permission_response(event.request_id)
                 continue
 
-            # Capture session_id from first ResultEvent if not yet known
             if isinstance(event, ResultEvent) and not self._session_id:
                 if event.session_id:
                     self._session_id = event.session_id
@@ -390,25 +326,20 @@ class Engine:
             yield event
 
             if isinstance(event, ResultEvent):
-                return  # End of turn
+                return
 
     async def stop(self) -> None:
         """Gracefully shut down the claude process."""
-        if self._state == EngineState.STOPPED:
+        if self._state == ClaudeState.STOPPED:
             return
 
-        self._state = EngineState.STOPPED
+        self._state = ClaudeState.STOPPED
         await self._cleanup()
 
     # -- Protocol helpers (static, unit-testable) -----------------------------
 
     @staticmethod
     def _format_user_message(content: list[dict]) -> dict:
-        """Format a user message for claude's stdin.
-
-        Args:
-            content: Messages API content blocks.
-        """
         return {
             "type": "user",
             "session_id": "",
@@ -418,7 +349,6 @@ class Engine:
 
     @staticmethod
     def _format_init_request() -> dict:
-        """Format the init handshake request."""
         return {
             "type": "control_request",
             "request_id": f"req_0_{os.urandom(4).hex()}",
@@ -431,7 +361,6 @@ class Engine:
 
     @staticmethod
     def _format_permission_response(request_id: str) -> dict:
-        """Format an auto-approve response to a permission request."""
         return {
             "type": "control_response",
             "response": {
@@ -443,10 +372,7 @@ class Engine:
 
     @staticmethod
     def _parse_event(raw: dict) -> Event:
-        """Parse a raw JSON dict into a typed Event.
-
-        This is the single point where wire protocol maps to our type system.
-        """
+        """Parse a raw JSON dict into a typed Event."""
         msg_type = raw.get("type", "")
 
         if msg_type == "assistant":
@@ -476,7 +402,6 @@ class Engine:
             )
 
         elif msg_type == "control_response":
-            # Init response — extract capabilities
             resp = raw.get("response", {})
             return InitEvent(
                 raw=raw,
@@ -486,7 +411,6 @@ class Engine:
             )
 
         elif msg_type == "stream_event":
-            # Streaming delta — Messages API format wrapped by claude
             inner = raw.get("event", {})
             return StreamEvent(raw=raw, inner=inner)
 
@@ -516,12 +440,6 @@ class Engine:
         if self._session_id:
             cmd.extend(["--resume", self._session_id])
 
-        if self.extra_args:
-            cmd.extend(self.extra_args)
-
-        # Clean env for subprocess:
-        # - Clear CLAUDECODE so we can spawn from within another claude process
-        # - Set ANTHROPIC_BASE_URL to route API requests through our proxy
         env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
         if self._proxy and self._proxy.port:
             env["ANTHROPIC_BASE_URL"] = self._proxy.base_url
@@ -546,7 +464,6 @@ class Engine:
             event = self._parse_event(raw)
             if isinstance(event, InitEvent):
                 return event
-            # Swallow system messages etc. during init
 
     async def _send_json(self, obj: dict) -> None:
         """Send a JSON object to claude's stdin."""
@@ -555,11 +472,7 @@ class Engine:
         await self._proc.stdin.drain()
 
     async def _read_json(self) -> dict | None:
-        """Read one JSON object from claude's stdout.
-
-        Returns None if the process has exited (EOF on stdout).
-        Skips blank lines and malformed JSON silently.
-        """
+        """Read one JSON object from claude's stdout."""
         assert self._proc and self._proc.stdout
         while True:
             line = await self._proc.stdout.readline()
@@ -574,7 +487,6 @@ class Engine:
                 continue
 
     async def _send_permission_response(self, request_id: str) -> None:
-        """Auto-approve a permission request."""
         await self._send_json(self._format_permission_response(request_id))
 
     async def _drain_stderr(self) -> None:
@@ -586,7 +498,7 @@ class Engine:
                 break
 
     async def _cleanup(self) -> None:
-        """Clean up the subprocess, background tasks, and proxy."""
+        """Clean up subprocess, background tasks, and proxy."""
         if self._proc:
             if self._proc.stdin and not self._proc.stdin.is_closing():
                 self._proc.stdin.close()

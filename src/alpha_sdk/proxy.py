@@ -1,12 +1,12 @@
 """proxy.py — HTTP proxy for the claude subprocess's API channel.
 
-The Engine manages four I/O channels:
+Claude manages four I/O channels:
   1. stdin  — JSON messages in
   2. stdout — JSON events out
   3. stderr — diagnostic output (drained in background)
   4. HTTP   — API requests via ANTHROPIC_BASE_URL
 
-This module handles #4. It is a private implementation detail of Engine.
+This module handles #4. It is a private implementation detail of Claude.
 No other module should import this directly.
 
 The proxy sits between claude and Anthropic's API. It:

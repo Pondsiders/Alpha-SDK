@@ -1,12 +1,11 @@
-"""Alpha SDK — everything that turns Claude into Alpha."""
+"""Alpha SDK — everything that turns Claude into someone."""
 
-__version__ = "1.0.0a6"
+__version__ = "1.0.0"
 
-from .client import AlphaClient
-from .engine import (
+from .claude import (
     AssistantEvent,
-    Engine,
-    EngineState,
+    Claude,
+    ClaudeState,
     ErrorEvent,
     Event,
     InitEvent,
@@ -15,19 +14,12 @@ from .engine import (
     SystemEvent,
     UserEvent,
 )
-from .queue import Message, MessageQueue
-from .replay import find_session_path, replay_session
-from .router import Observer, Router
-from .session import Session
+from .system_prompt import read_soul
 
 __all__ = [
-    # Client
-    "AlphaClient",
-    # Session
-    "Session",
-    # Engine
-    "Engine",
-    "EngineState",
+    # The one class
+    "Claude",
+    "ClaudeState",
     # Events
     "Event",
     "InitEvent",
@@ -37,13 +29,6 @@ __all__ = [
     "SystemEvent",
     "ErrorEvent",
     "StreamEvent",
-    # Queue
-    "Message",
-    "MessageQueue",
-    # Router
-    "Router",
-    "Observer",
-    # Replay
-    "replay_session",
-    "find_session_path",
+    # System prompt
+    "read_soul",
 ]
