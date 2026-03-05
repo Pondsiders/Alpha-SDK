@@ -1,8 +1,7 @@
-"""Shared test fixtures for Alpha SDK Next.
+"""Shared test fixtures for Alpha SDK.
 
-Protocol fixtures based on quack-raw.py and quack-wire.py observations
-(Feb 26, 2026). These represent the actual JSON messages claude
-sends/receives over stdio.
+Protocol fixtures based on the stream-json wire format claude uses
+over stdio. These represent actual JSON messages from observation.
 """
 
 import json
@@ -16,25 +15,11 @@ import pytest
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
-        "integration: marks tests that need live claude process or database",
+        "integration: marks tests that spawn a live claude process (cost: ~$0.001/test)",
     )
 
 
 # -- Canned protocol fixtures ------------------------------------------------
-
-
-@pytest.fixture
-def sample_init_request():
-    """The init handshake request we send to claude."""
-    return {
-        "type": "control_request",
-        "request_id": "req_0_deadbeef",
-        "request": {
-            "subtype": "initialize",
-            "hooks": {},
-            "agents": {},
-        },
-    }
 
 
 @pytest.fixture
@@ -48,10 +33,6 @@ def sample_init_response():
             "tools": [
                 {"name": "Bash", "type": "tool"},
                 {"name": "Read", "type": "tool"},
-                {"name": "Write", "type": "tool"},
-                {"name": "Edit", "type": "tool"},
-                {"name": "Glob", "type": "tool"},
-                {"name": "Grep", "type": "tool"},
             ],
             "mcpServers": [],
         },
@@ -89,19 +70,6 @@ def sample_tool_use_message():
 
 
 @pytest.fixture
-def sample_control_request():
-    """A permission request from claude (e.g., tool approval)."""
-    return {
-        "type": "control_request",
-        "request_id": "req_42_cafebabe",
-        "request": {
-            "subtype": "tool_permission",
-            "tool_name": "Bash",
-        },
-    }
-
-
-@pytest.fixture
 def sample_result():
     """End-of-turn result message."""
     return {
@@ -110,22 +78,7 @@ def sample_result():
         "total_cost_usd": 0.0042,
         "num_turns": 1,
         "duration_ms": 1234,
-        "duration_api_ms": 987,
         "is_error": False,
-        "usage": {
-            "input_tokens": 150,
-            "output_tokens": 42,
-        },
-    }
-
-
-@pytest.fixture
-def sample_system_message():
-    """A system message from claude."""
-    return {
-        "type": "system",
-        "subtype": "session_id",
-        "session_id": "sess_abc123def456",
     }
 
 
@@ -138,12 +91,6 @@ def sample_user_message():
         "message": {"role": "user", "content": [{"type": "text", "text": "Hello, world!"}]},
         "parent_tool_use_id": None,
     }
-
-
-@pytest.fixture
-def sample_conversation_turn(sample_assistant_message, sample_result):
-    """A minimal conversation turn: assistant text + result."""
-    return [sample_assistant_message, sample_result]
 
 
 # -- Helpers ------------------------------------------------------------------

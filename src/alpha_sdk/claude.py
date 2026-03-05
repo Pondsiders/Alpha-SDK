@@ -203,12 +203,14 @@ class Claude:
         mcp_config: str | None = None,
         permission_mode: str = "bypassPermissions",
         compact_config: CompactConfig | None = None,
+        extra_args: list[str] | None = None,
     ):
         self.model = model
         self.system_prompt = system_prompt
         self.mcp_config = mcp_config
         self.permission_mode = permission_mode
         self.compact_config = compact_config
+        self.extra_args: list[str] = extra_args or []
 
         self._state = ClaudeState.IDLE
         self._proc: asyncio.subprocess.Process | None = None
@@ -439,6 +441,9 @@ class Claude:
 
         if self._session_id:
             cmd.extend(["--resume", self._session_id])
+
+        if self.extra_args:
+            cmd.extend(self.extra_args)
 
         env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
         if self._proxy and self._proxy.port:

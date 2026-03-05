@@ -34,8 +34,8 @@ import pytest
 # Monkey-patch the capture flag at runtime — it's evaluated at import time.
 import alpha_sdk.proxy as _proxy_module
 
-from alpha_sdk.engine import (
-    Engine,
+from alpha_sdk.claude import (
+    Claude,
     AssistantEvent,
     ErrorEvent,
     Event,
@@ -73,6 +73,11 @@ CAPTURE_DIR = Path(__file__).parent / "captures"
 
 
 # -- Helpers ----------------------------------------------------------------
+
+
+def _text_blocks(text: str) -> list[dict]:
+    """Wrap a string as content blocks for Claude.send()."""
+    return [{"type": "text", "text": text}]
 
 
 def _clear_captures():
@@ -216,7 +221,7 @@ class TestManualCompact:
         - Whether the rewrite actually replaced the text
         - What to update in proxy.py if claude changed its format
         """
-        engine = Engine(
+        frog = Claude(
             model="haiku",
             system_prompt="Reply with exactly one short sentence. No tools.",
             compact_config=COMPACT_CONFIG,
@@ -224,13 +229,13 @@ class TestManualCompact:
         )
 
         try:
-            await engine.start()
+            await frog.start()
 
             # Build context — need enough for /compact to have something to summarize
             filler = "The quick brown fox. " * 200  # ~1K tokens
             for i in range(3):
-                await engine.send(f"Test message {i}: {filler}")
-                async for event in engine.events():
+                await frog.send(_text_blocks(f"Test message {i}: {filler}"))
+                async for event in frog.events():
                     if isinstance(event, (ResultEvent, ErrorEvent)):
                         break
 
@@ -238,8 +243,8 @@ class TestManualCompact:
             _clear_captures()
 
             # Send /compact
-            await engine.send("/compact")
-            async for event in engine.events():
+            await frog.send(_text_blocks("/compact"))
+            async for event in frog.events():
                 if isinstance(event, (ResultEvent, ErrorEvent)):
                     break
 
@@ -295,7 +300,7 @@ class TestManualCompact:
             )
 
         finally:
-            await engine.stop()
+            await frog.stop()
 
     async def test_phase1_not_present_on_manual_compact(self):
         """Phase 1: manual /compact does NOT swap the system prompt.
@@ -307,7 +312,7 @@ class TestManualCompact:
         summarizer signature), claude changed behavior and Phase 1 now fires
         on manual compact. That's not a bug; it's new information.
         """
-        engine = Engine(
+        frog = Claude(
             model="haiku",
             system_prompt="Reply with exactly one short sentence. No tools.",
             compact_config=COMPACT_CONFIG,
@@ -315,18 +320,18 @@ class TestManualCompact:
         )
 
         try:
-            await engine.start()
+            await frog.start()
 
             filler = "The quick brown fox. " * 200
             for i in range(3):
-                await engine.send(f"Test message {i}: {filler}")
-                async for event in engine.events():
+                await frog.send(_text_blocks(f"Test message {i}: {filler}"))
+                async for event in frog.events():
                     if isinstance(event, (ResultEvent, ErrorEvent)):
                         break
 
             _clear_captures()
-            await engine.send("/compact")
-            async for event in engine.events():
+            await frog.send(_text_blocks("/compact"))
+            async for event in frog.events():
                 if isinstance(event, (ResultEvent, ErrorEvent)):
                     break
 
@@ -348,7 +353,7 @@ class TestManualCompact:
             # If we get here, Phase 1 doesn't fire. That's the expected behavior.
 
         finally:
-            await engine.stop()
+            await frog.stop()
 
 
 # -- Auto-compact tests -----------------------------------------------------
@@ -385,7 +390,7 @@ class TestAutoCompact:
         os.environ["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = "10"
 
         try:
-            engine = Engine(
+            frog = Claude(
                 model="haiku",
                 system_prompt="Reply with exactly one short sentence. No tools.",
                 compact_config=COMPACT_CONFIG,
@@ -393,7 +398,7 @@ class TestAutoCompact:
             )
 
             try:
-                await engine.start()
+                await frog.start()
 
                 # -- Build context until auto-compact fires --
                 # ~10K tokens per chunk. At 10% of 200K = 20K threshold,
@@ -412,12 +417,12 @@ class TestAutoCompact:
                     # we break immediately after detection.
                     _clear_captures()
 
-                    await engine.send(
+                    await frog.send(_text_blocks(
                         f"This is chunk {turn}. {filler}\n"
                         f"Acknowledge chunk {turn} in one sentence."
-                    )
+                    ))
 
-                    async for event in engine.events():
+                    async for event in frog.events():
                         # Detect compact via event stream
                         if hasattr(event, "raw") and isinstance(event.raw, dict):
                             raw_type = event.raw.get("type", "")
@@ -451,12 +456,12 @@ class TestAutoCompact:
                     f"Auto-compact never triggered after {max_turns} turns.\n"
                     f"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=10 should trigger "
                     f"at ~20K tokens (10% of 200K).\n"
-                    f"Token count: {engine.token_count}\n"
-                    f"Context window: {engine.context_window}\n"
+                    f"Token count: {frog.token_count}\n"
+                    f"Context window: {frog.context_window}\n"
                     f"Chunks sent: {max_turns} × ~10K tokens each\n"
                     f"\nPossible causes:\n"
                     f"  1. Env var not reaching subprocess "
-                    f"(check Engine._spawn env handling)\n"
+                    f"(check Claude._spawn env handling)\n"
                     f"  2. Auto-compact threshold works differently "
                     f"than documented\n"
                     f"  3. Compact events not detected in stream "
@@ -516,8 +521,10 @@ class TestAutoCompact:
                 # message and check that turn's captures too.
                 if not phase3_detected and not phase3_rewritten:
                     _clear_captures()
-                    await engine.send("What were we just discussing?")
-                    async for event in engine.events():
+                    await frog.send(_text_blocks(
+                        "What were we just discussing?"
+                    ))
+                    async for event in frog.events():
                         if isinstance(event, (ResultEvent, ErrorEvent)):
                             break
 
@@ -582,7 +589,7 @@ class TestAutoCompact:
                     pass
 
             finally:
-                await engine.stop()
+                await frog.stop()
 
         finally:
             os.environ.pop("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", None)
