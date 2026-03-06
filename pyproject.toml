@@ -12,6 +12,8 @@ dependencies = [
     # The claude runtime. Bundles the native CLI binary.
     # Pinned exact — we upgrade intentionally, not by accident.
     "claude-agent-sdk==0.1.44",
+    # Observability. We married it — hard dep, not optional.
+    "logfire>=3.0.0",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +33,9 @@ packages = ["src/alpha_sdk"]
 asyncio_mode = "auto"
 markers = [
     "integration: marks tests that need live claude process or database",
+]
+filterwarnings = [
+    "ignore::logfire._internal.config.LogfireNotConfiguredWarning",
 ]
 
 [dependency-groups]

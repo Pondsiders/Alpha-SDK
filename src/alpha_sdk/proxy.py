@@ -11,13 +11,14 @@ No other module should import this directly.
 
 The proxy sits between claude and Anthropic's API. It:
 - Rewrites compact requests (three-phase surgical intervention)
-- Sniffs input_tokens from streaming response SSE events (message_start)
+- Sniffs usage data from streaming SSE events (message_start + message_delta)
 - Sniffs usage quota headers from responses
 
-Token counting works by parsing the Anthropic SSE stream in-flight.
-Every streaming response starts with a message_start event containing
-usage.input_tokens — the total prompt size. We extract this as the
-response flows through, zero extra API calls, zero extra latency.
+Usage extraction works by parsing the Anthropic SSE stream in-flight:
+- message_start: input tokens (with cache breakdown), model, response ID
+- message_delta: output tokens, stop reason
+- Response headers: 5h and 7d quota utilization
+Zero extra API calls, zero extra latency.
 
 The compact rewriting logic is ported from v1.x compact_proxy.py.
 Detection signatures are constants (what claude sends).
@@ -27,6 +28,7 @@ Replacement content comes from CompactConfig (what we inject).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import socket
@@ -35,6 +37,7 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
+import logfire
 from aiohttp import web
 
 
@@ -327,13 +330,25 @@ class _Proxy:
         self._site: web.TCPSite | None = None
         self._http_client: httpx.AsyncClient | None = None
 
-        # Token counting state
-        self._token_count = 0
+        # Per-request state — updated from SSE stream
+        self._token_count = 0          # Total input tokens (sum for context window)
+        self._input_tokens = 0         # Raw input tokens (non-cached)
+        self._cache_creation_tokens = 0  # Tokens written to cache this request
+        self._cache_read_tokens = 0    # Tokens read from cache this request
+        self._output_tokens = 0        # Output tokens generated
+        self._stop_reason: str | None = None  # e.g. "end_turn", "max_tokens"
+        self._response_model: str | None = None  # Model from response
+        self._response_id: str | None = None  # Message ID from response
+
         self._warned_no_api_key = False
 
         # Usage quota state (from Anthropic response headers)
         self._usage_7d: float | None = None
         self._usage_5h: float | None = None
+
+        # Trace context — set by consumer before each turn so proxy spans
+        # nest under the same trace as the turn span.
+        self._trace_context: dict | None = None
 
     # -- Properties -----------------------------------------------------------
 
@@ -363,9 +378,52 @@ class _Proxy:
     def usage_5h(self) -> float | None:
         return self._usage_5h
 
+    @property
+    def input_tokens(self) -> int:
+        return self._input_tokens
+
+    @property
+    def cache_creation_tokens(self) -> int:
+        return self._cache_creation_tokens
+
+    @property
+    def cache_read_tokens(self) -> int:
+        return self._cache_read_tokens
+
+    @property
+    def output_tokens(self) -> int:
+        return self._output_tokens
+
+    @property
+    def stop_reason(self) -> str | None:
+        return self._stop_reason
+
+    @property
+    def response_model(self) -> str | None:
+        return self._response_model
+
+    @property
+    def response_id(self) -> str | None:
+        return self._response_id
+
     def reset_token_count(self) -> None:
-        """Reset token count to 0. Call after compaction."""
+        """Reset per-request state. Call after compaction."""
         self._token_count = 0
+        self._input_tokens = 0
+        self._cache_creation_tokens = 0
+        self._cache_read_tokens = 0
+        self._output_tokens = 0
+        self._stop_reason = None
+        self._response_model = None
+        self._response_id = None
+
+    def set_trace_context(self, ctx: dict | None) -> None:
+        """Set trace context for proxy request handlers to inherit.
+
+        Call with logfire.get_context() before each turn so proxy spans
+        (like quota header logging) nest under the consumer's turn span.
+        """
+        self._trace_context = ctx
 
     # -- Lifecycle ------------------------------------------------------------
 
@@ -401,19 +459,29 @@ class _Proxy:
     # -- Request handling -----------------------------------------------------
 
     async def _handle_request(self, request: web.Request) -> web.StreamResponse:
-        """Route incoming requests."""
-        path = "/" + request.match_info.get("path", "")
+        """Route incoming requests.
 
-        if request.method == "GET" and path == "/health":
-            return web.Response(text="ok")
+        Attaches the consumer's trace context (if set) so any logfire
+        calls within the handler nest under the same trace as the turn span.
+        """
+        ctx = (
+            logfire.attach_context(self._trace_context)
+            if self._trace_context
+            else contextlib.nullcontext()
+        )
+        with ctx:
+            path = "/" + request.match_info.get("path", "")
 
-        if request.method != "POST":
-            return web.Response(status=404, text="Not found")
+            if request.method == "GET" and path == "/health":
+                return web.Response(text="ok")
 
-        try:
-            return await self._forward_request(request, path)
-        except Exception as e:
-            return web.Response(status=500, text=str(e))
+            if request.method != "POST":
+                return web.Response(status=404, text="Not found")
+
+            try:
+                return await self._forward_request(request, path)
+            except Exception as e:
+                return web.Response(status=500, text=str(e))
 
     async def _forward_request(
         self, request: web.Request, path: str
@@ -432,11 +500,12 @@ class _Proxy:
             self._capture_request(path, copy.deepcopy(body), suffix="before")
 
         # Rewrite compact prompts if config provided
+        compact_rewritten = False
         if body is not None and self._compact_config is not None:
-            rewrite_compact(body, self._compact_config)
+            compact_rewritten = rewrite_compact(body, self._compact_config)
             body_bytes = json.dumps(body).encode()
 
-        # Debug capture — after rewrite
+        # Debug capture — after rewrite (compact_rewritten tracked for spans added later)
         if CAPTURE_REQUESTS and body is not None:
             self._capture_request(path, body, suffix="after")
 
@@ -478,127 +547,67 @@ class _Proxy:
 
             await resp.prepare(request)
 
-            # Sniff SSE stream for usage info while forwarding.
-            # message_start is always the first event — once found, stop scanning.
+            # Sniff SSE stream for usage data while forwarding.
+            # Scans for message_start (input tokens, model, id) and
+            # message_delta (output tokens, stop reason).
             sse_buffer = ""
-            usage_found = False
 
             async for chunk in response.aiter_bytes():
                 await resp.write(chunk)
 
-                if not usage_found:
-                    sse_buffer += chunk.decode("utf-8", errors="replace")
-                    tokens = self._extract_usage_from_sse(sse_buffer)
-                    if tokens is not None:
-                        self._token_count = tokens  # Direct set (not high-water — must drop after compact)
-                        usage_found = True
-                        sse_buffer = ""  # Free the buffer
+                sse_buffer += chunk.decode("utf-8", errors="replace")
+
+                # Process complete lines, keep partial tail
+                while "\n" in sse_buffer:
+                    line, sse_buffer = sse_buffer.split("\n", 1)
+                    line = line.strip()
+                    if line.startswith("data: "):
+                        raw = line[6:]
+                        # Only parse events we care about
+                        if '"message_start"' in raw or '"message_delta"' in raw:
+                            self._process_sse_data(raw)
 
             await resp.write_eof()
             return resp
 
     # -- SSE usage extraction -------------------------------------------------
 
-    @staticmethod
-    def _extract_usage_from_sse(buffer: str) -> int | None:
-        """Extract total input tokens from a message_start SSE event.
+    def _process_sse_data(self, data: str) -> None:
+        """Process an SSE data payload for usage information.
 
-        Scans an accumulated SSE buffer for the message_start event
-        and returns the total input token count — including cached tokens.
-
-        The message_start event is always the first event in a streaming
-        response. Its data payload contains three token counts:
-            input_tokens              — non-cached (cache miss) tokens
-            cache_creation_input_tokens — tokens written to cache this request
-            cache_read_input_tokens    — tokens served from cache
-
-        All three contribute to context window usage. Caching is a billing
-        and latency optimization — it doesn't reduce how much of the window
-        is occupied. A cached 18k system prompt still uses 18k of context.
+        Handles two event types from the Anthropic streaming API:
+        - message_start: input tokens (with cache breakdown), model, response ID
+        - message_delta: output tokens, stop reason
         """
-        for line in buffer.split("\n"):
-            if not line.startswith("data: "):
-                continue
-            try:
-                payload = json.loads(line[6:])  # Skip "data: " prefix
-                if payload.get("type") == "message_start":
-                    usage = payload.get("message", {}).get("usage", {})
-                    return (
-                        usage.get("input_tokens", 0)
-                        + usage.get("cache_creation_input_tokens", 0)
-                        + usage.get("cache_read_input_tokens", 0)
-                    )
-            except (json.JSONDecodeError, ValueError):
-                continue
-        return None
-
-    # -- Token counting (DEPRECATED — kept for reference) ---------------------
-    # Replaced by _extract_usage_from_sse above. The fire-and-forget approach
-    # required a separate API key and a separate API call per turn. The SSE
-    # sniffing approach gets real numbers from the actual response stream
-    # with zero extra API calls.
-
-    async def _count_tokens(self, body: dict, headers: dict) -> None:
-        """Count tokens via fire-and-forget to /v1/messages/count_tokens.
-
-        Uses ALPHA_ANTHROPIC_API_KEY (not ANTHROPIC_API_KEY) to avoid
-        interference with Claude Max auth.
-        """
-        if self._http_client is None:
-            return
-
-        api_key = os.environ.get("ALPHA_ANTHROPIC_API_KEY")
-        if not api_key:
-            if not self._warned_no_api_key:
-                self._warned_no_api_key = True
-            return
-
         try:
-            count_headers = {
-                "x-api-key": api_key,
-                "anthropic-version": headers.get("anthropic-version", "2023-06-01"),
-                "content-type": "application/json",
-            }
+            payload = json.loads(data)
+        except (json.JSONDecodeError, ValueError):
+            return
 
-            # Only fields the count endpoint accepts
-            count_body = {}
-            for key in ("messages", "model", "system", "tools", "tool_choice", "thinking"):
-                if key in body:
-                    count_body[key] = body[key]
+        event_type = payload.get("type", "")
 
-            # Strip cache_control from tools (count endpoint is stricter)
-            if "tools" in count_body:
-                cleaned = []
-                for tool in count_body["tools"]:
-                    tool = dict(tool)
-                    tool.pop("cache_control", None)
-                    if "custom" in tool and isinstance(tool["custom"], dict):
-                        tool["custom"] = {
-                            k: v for k, v in tool["custom"].items()
-                            if k != "cache_control"
-                        }
-                    cleaned.append(tool)
-                count_body["tools"] = cleaned
+        if event_type == "message_start":
+            message = payload.get("message", {})
+            usage = message.get("usage", {})
 
-            response = await self._http_client.post(
-                f"{self._upstream_url}/v1/messages/count_tokens",
-                content=json.dumps(count_body).encode(),
-                headers=count_headers,
-                timeout=10.0,
+            self._input_tokens = usage.get("input_tokens", 0)
+            self._cache_creation_tokens = usage.get("cache_creation_input_tokens", 0)
+            self._cache_read_tokens = usage.get("cache_read_input_tokens", 0)
+            # Total for context window tracking (all three count toward the window)
+            self._token_count = (
+                self._input_tokens
+                + self._cache_creation_tokens
+                + self._cache_read_tokens
             )
+            self._response_model = message.get("model")
+            self._response_id = message.get("id")
 
-            if response.status_code != 200:
-                return
+        elif event_type == "message_delta":
+            usage = payload.get("usage", {})
+            delta = payload.get("delta", {})
 
-            result = response.json()
-            new_count = result.get("input_tokens", 0)
-
-            # High-water mark — only update upward
-            if new_count > self._token_count:
-                self._token_count = new_count
-
-        except Exception:
-            pass  # Fire and forget
+            self._output_tokens = usage.get("output_tokens", 0)
+            self._stop_reason = delta.get("stop_reason")
 
     # -- Usage headers --------------------------------------------------------
 
@@ -606,6 +615,10 @@ class _Proxy:
         """Extract usage quota from Anthropic response headers."""
         util_7d = headers.get("anthropic-ratelimit-unified-7d-utilization")
         util_5h = headers.get("anthropic-ratelimit-unified-5h-utilization")
+
+        # No debug logging here — the raw headers have been inspected and
+        # confirmed: Anthropic sends 1-2 decimal places of precision.
+        # The float() conversion below is lossless.
 
         if util_7d is not None:
             try:

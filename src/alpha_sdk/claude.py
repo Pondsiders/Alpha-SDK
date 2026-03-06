@@ -251,10 +251,46 @@ class Claude:
     def usage_5h(self) -> float | None:
         return self._proxy.usage_5h if self._proxy else None
 
+    @property
+    def input_tokens(self) -> int:
+        return self._proxy.input_tokens if self._proxy else 0
+
+    @property
+    def cache_creation_tokens(self) -> int:
+        return self._proxy.cache_creation_tokens if self._proxy else 0
+
+    @property
+    def cache_read_tokens(self) -> int:
+        return self._proxy.cache_read_tokens if self._proxy else 0
+
+    @property
+    def output_tokens(self) -> int:
+        return self._proxy.output_tokens if self._proxy else 0
+
+    @property
+    def stop_reason(self) -> str | None:
+        return self._proxy.stop_reason if self._proxy else None
+
+    @property
+    def response_model(self) -> str | None:
+        return self._proxy.response_model if self._proxy else None
+
+    @property
+    def response_id(self) -> str | None:
+        return self._proxy.response_id if self._proxy else None
+
     def reset_token_count(self) -> None:
         """Reset token count to 0. Call after compaction."""
         if self._proxy:
             self._proxy.reset_token_count()
+
+    def set_trace_context(self, ctx: dict | None) -> None:
+        """Set trace context so proxy spans nest under the consumer's trace.
+
+        Call with logfire.get_context() before each turn.
+        """
+        if self._proxy:
+            self._proxy.set_trace_context(ctx)
 
     # -- Lifecycle ------------------------------------------------------------
 

@@ -31,9 +31,10 @@ def _find_free_port() -> int:
 # streaming and token sniffing without hitting the real API.
 FAKE_SSE_RESPONSE = (
     "event: message_start\n"
-    'data: {"type":"message_start","message":{"usage":'
-    '{"input_tokens":100,"cache_creation_input_tokens":0,'
-    '"cache_read_input_tokens":0}}}\n\n'
+    'data: {"type":"message_start","message":{"id":"msg_test123",'
+    '"model":"claude-haiku-4-5-20251001","usage":'
+    '{"input_tokens":80,"cache_creation_input_tokens":10,'
+    '"cache_read_input_tokens":10}}}\n\n'
     "event: content_block_start\n"
     'data: {"type":"content_block_start","index":0,'
     '"content_block":{"type":"text","text":""}}\n\n'
@@ -189,8 +190,66 @@ class TestProxyForwarding:
                     headers={"content-type": "application/json"},
                 )
 
-            # Token count sniffed from message_start: input_tokens=100
+            # Token count = input(80) + cache_creation(10) + cache_read(10) = 100
             assert proxy.token_count == 100
+
+        finally:
+            await proxy.stop()
+
+    async def test_sniffs_full_usage_breakdown(self, fake_upstream):
+        """Proxy captures individual token counts, not just the sum."""
+        proxy = _Proxy(upstream_url=fake_upstream["url"])
+        await proxy.start()
+
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    f"http://127.0.0.1:{proxy.port}/v1/messages",
+                    json={"messages": [{"role": "user", "content": "Hello"}]},
+                    headers={"content-type": "application/json"},
+                )
+
+            assert proxy.input_tokens == 80
+            assert proxy.cache_creation_tokens == 10
+            assert proxy.cache_read_tokens == 10
+
+        finally:
+            await proxy.stop()
+
+    async def test_sniffs_output_tokens_and_stop_reason(self, fake_upstream):
+        """Proxy captures output_tokens and stop_reason from message_delta."""
+        proxy = _Proxy(upstream_url=fake_upstream["url"])
+        await proxy.start()
+
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    f"http://127.0.0.1:{proxy.port}/v1/messages",
+                    json={"messages": [{"role": "user", "content": "Hello"}]},
+                    headers={"content-type": "application/json"},
+                )
+
+            assert proxy.output_tokens == 5
+            assert proxy.stop_reason == "end_turn"
+
+        finally:
+            await proxy.stop()
+
+    async def test_sniffs_response_model_and_id(self, fake_upstream):
+        """Proxy captures model and message ID from message_start."""
+        proxy = _Proxy(upstream_url=fake_upstream["url"])
+        await proxy.start()
+
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    f"http://127.0.0.1:{proxy.port}/v1/messages",
+                    json={"messages": [{"role": "user", "content": "Hello"}]},
+                    headers={"content-type": "application/json"},
+                )
+
+            assert proxy.response_model == "claude-haiku-4-5-20251001"
+            assert proxy.response_id == "msg_test123"
 
         finally:
             await proxy.stop()
