@@ -1,0 +1,22 @@
+# Alpha SDK Docker build context filter (used as additional context in Alpha-App)
+# Without this, Docker hashes 299MB+ including the .venv,
+# which drowns out actual source changes and breaks cache invalidation.
+
+# Python — the venv is 297MB of installed packages
+.venv/
+**/__pycache__/
+*.pyc
+*.egg-info/
+
+# Tests — not part of the installed package
+tests/
+
+# Scripts
+scripts/
+
+# Git (worktree pointer file, not a directory)
+.git
+
+# IDE
+.vscode/
+.idea/
