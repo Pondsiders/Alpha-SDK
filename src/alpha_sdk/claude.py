@@ -256,6 +256,11 @@ class Claude:
         return self._proxy.input_tokens if self._proxy else 0
 
     @property
+    def total_input_tokens(self) -> int:
+        """OTel-compliant total: uncached + cache_creation + cache_read."""
+        return self._proxy.total_input_tokens if self._proxy else 0
+
+    @property
     def cache_creation_tokens(self) -> int:
         return self._proxy.cache_creation_tokens if self._proxy else 0
 

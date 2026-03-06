@@ -383,6 +383,17 @@ class _Proxy:
         return self._input_tokens
 
     @property
+    def total_input_tokens(self) -> int:
+        """OTel-compliant total input tokens.
+
+        Anthropic's raw input_tokens excludes cached tokens.  The OpenTelemetry
+        semantic conventions for Anthropic (footnote [11]) require:
+            gen_ai.usage.input_tokens = input_tokens
+                + cache_read_input_tokens + cache_creation_input_tokens
+        """
+        return self._input_tokens + self._cache_creation_tokens + self._cache_read_tokens
+
+    @property
     def cache_creation_tokens(self) -> int:
         return self._cache_creation_tokens
 
