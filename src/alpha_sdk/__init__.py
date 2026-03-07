@@ -14,7 +14,7 @@ from .claude import (
     SystemEvent,
     UserEvent,
 )
-from .system_prompt import read_soul
+from .system_prompt import assemble_system_prompt, read_soul
 
 __all__ = [
     # The one class
@@ -30,5 +30,6 @@ __all__ = [
     "ErrorEvent",
     "StreamEvent",
     # System prompt
+    "assemble_system_prompt",
     "read_soul",
 ]
