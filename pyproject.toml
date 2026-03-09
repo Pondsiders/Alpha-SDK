@@ -14,6 +14,8 @@ dependencies = [
     "claude-agent-sdk==0.1.44",
     # Observability. We married it — hard dep, not optional.
     "logfire>=3.0.0",
+    # Memory database — direct access, no ORM, no abstraction.
+    "asyncpg>=0.29.0",
 ]
 
 [project.optional-dependencies]

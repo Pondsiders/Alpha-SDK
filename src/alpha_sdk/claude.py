@@ -25,7 +25,9 @@ import os
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
+
+from mcp.types import CallToolRequest, CallToolRequestParams, ListToolsRequest
 
 from .proxy import CompactConfig, _Proxy
 
@@ -174,7 +176,7 @@ class StreamEvent(Event):
 # Internal — not yielded to consumers
 @dataclass
 class _ControlRequestEvent(Event):
-    """Permission request from claude. Handled internally by auto-approve."""
+    """Control request from claude (MCP messages, permission requests, etc.)."""
 
     request_id: str = ""
     tool_name: str = ""
@@ -204,6 +206,8 @@ class Claude:
         permission_mode: str = "bypassPermissions",
         compact_config: CompactConfig | None = None,
         extra_args: list[str] | None = None,
+        mcp_servers: dict[str, Any] | None = None,
+        permission_handler: Callable[[dict], Awaitable[bool]] | None = None,
     ):
         self.model = model
         self.system_prompt = system_prompt
@@ -211,6 +215,8 @@ class Claude:
         self.permission_mode = permission_mode
         self.compact_config = compact_config
         self.extra_args: list[str] = extra_args or []
+        self._mcp_servers: dict[str, Any] = mcp_servers or {}
+        self._permission_handler = permission_handler
 
         self._state = ClaudeState.IDLE
         self._proc: asyncio.subprocess.Process | None = None
@@ -342,8 +348,10 @@ class Claude:
     async def events(self) -> AsyncIterator[Event]:
         """Yield events from claude's response stream.
 
-        Reads until a ResultEvent (end of turn). Auto-approves
-        permission requests — consumers never see them.
+        Reads until a ResultEvent (end of turn). Control requests
+        are handled internally: MCP messages are dispatched to
+        in-process servers, permission requests go to the consumer's
+        handler. Consumers never see control requests.
         """
         if self._state != ClaudeState.READY:
             raise RuntimeError(f"Cannot read events in state {self._state}")
@@ -359,7 +367,7 @@ class Claude:
             event = self._parse_event(raw)
 
             if isinstance(event, _ControlRequestEvent):
-                await self._send_permission_response(event.request_id)
+                await self._handle_control_request(event)
                 continue
 
             if isinstance(event, ResultEvent) and not self._session_id:
@@ -460,6 +468,192 @@ class Claude:
         else:
             return Event(raw=raw)
 
+    # -- MCP dispatch ---------------------------------------------------------
+
+    def _build_mcp_config(self) -> str | None:
+        """Build merged MCP config for --mcp-config flag.
+
+        Merges consumer's external MCP config with SDK's in-process
+        servers. Consumer config can be inline JSON or a file path.
+        SDK servers use type "sdk" so claude routes them back to us.
+        """
+        merged: dict[str, dict] = {}
+
+        # Consumer config — inline JSON or file path
+        if self.mcp_config:
+            try:
+                consumer = json.loads(self.mcp_config)
+                merged.update(consumer.get("mcpServers", {}))
+            except json.JSONDecodeError:
+                config_path = Path(self.mcp_config)
+                if config_path.exists():
+                    with open(config_path) as f:
+                        consumer = json.load(f)
+                    merged.update(consumer.get("mcpServers", {}))
+
+        # SDK in-process servers — type "sdk" routes back to us
+        for name in self._mcp_servers:
+            merged[name] = {"type": "sdk", "name": name}
+
+        if not merged:
+            return None
+
+        return json.dumps({"mcpServers": merged})
+
+    async def _dispatch_mcp(self, server_name: str, mcp_msg: dict) -> dict:
+        """Dispatch an MCP JSON-RPC message to an in-process FastMCP server.
+
+        Routes by method, calls request_handlers directly. No transport
+        layer — just dict in, dict out. Copied from quack-mcp.py which
+        copied from the Agent SDK's query.py.
+        """
+        server_instance = self._mcp_servers.get(server_name)
+        if not server_instance:
+            return {
+                "jsonrpc": "2.0",
+                "id": mcp_msg.get("id"),
+                "error": {
+                    "code": -32601,
+                    "message": f"Unknown SDK MCP server: {server_name}",
+                },
+            }
+
+        low_level = server_instance._mcp_server
+        method = mcp_msg.get("method")
+        params = mcp_msg.get("params", {})
+        msg_id = mcp_msg.get("id")
+
+        try:
+            if method == "initialize":
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {
+                            "name": server_instance.name,
+                            "version": "1.0.0",
+                        },
+                    },
+                }
+
+            elif method == "notifications/initialized":
+                return {"jsonrpc": "2.0", "result": {}}
+
+            elif method == "tools/list":
+                request = ListToolsRequest(method=method)
+                handler = low_level.request_handlers.get(ListToolsRequest)
+                if not handler:
+                    raise Exception("No tools/list handler registered")
+                result = await handler(request)
+                tools_data = [
+                    {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "inputSchema": (
+                            tool.inputSchema.model_dump()
+                            if hasattr(tool.inputSchema, "model_dump")
+                            else tool.inputSchema
+                        )
+                        if tool.inputSchema
+                        else {},
+                    }
+                    for tool in result.root.tools
+                ]
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {"tools": tools_data},
+                }
+
+            elif method == "tools/call":
+                call_request = CallToolRequest(
+                    method=method,
+                    params=CallToolRequestParams(
+                        name=params.get("name"),
+                        arguments=params.get("arguments", {}),
+                    ),
+                )
+                handler = low_level.request_handlers.get(CallToolRequest)
+                if not handler:
+                    raise Exception("No tools/call handler registered")
+                result = await handler(call_request)
+                content = []
+                for item in result.root.content:
+                    if hasattr(item, "text"):
+                        content.append({"type": "text", "text": item.text})
+                    elif hasattr(item, "data") and hasattr(item, "mimeType"):
+                        content.append({
+                            "type": "image",
+                            "data": item.data,
+                            "mimeType": item.mimeType,
+                        })
+                response_data: dict = {"content": content}
+                if hasattr(result.root, "is_error") and result.root.is_error:
+                    response_data["is_error"] = True
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": response_data,
+                }
+
+            else:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {
+                        "code": -32601,
+                        "message": f"Method '{method}' not found",
+                    },
+                }
+
+        except Exception as e:
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {"code": -32603, "message": str(e)},
+            }
+
+    async def _handle_control_request(self, event: _ControlRequestEvent) -> None:
+        """Handle a control_request — MCP dispatch or permission request.
+
+        Three-way split:
+        - MCP message → dispatch to in-process FastMCP server
+        - Permission request + handler → delegate to consumer callback
+        - Permission request + no handler → RuntimeError (fail loud)
+        """
+        req = event.request
+        subtype = req.get("subtype", "")
+
+        if subtype == "mcp_message":
+            server_name = req.get("server_name", "")
+            mcp_msg = req.get("message", {})
+            mcp_response = await self._dispatch_mcp(server_name, mcp_msg)
+            await self._send_json({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": event.request_id,
+                    "response": {"mcp_response": mcp_response},
+                },
+            })
+        elif self._permission_handler:
+            approved = await self._permission_handler(req)
+            await self._send_json({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": event.request_id,
+                    "response": {"approved": approved},
+                },
+            })
+        else:
+            raise RuntimeError(
+                f"Permission request received but no permission_handler "
+                f"configured. Tool: {event.tool_name}, subtype: {subtype}"
+            )
+
     # -- Subprocess management ------------------------------------------------
 
     async def _spawn(self) -> asyncio.subprocess.Process:
@@ -477,8 +671,9 @@ class Claude:
         if self.system_prompt is not None:
             cmd.extend(["--system-prompt", self.system_prompt])
 
-        if self.mcp_config:
-            cmd.extend(["--mcp-config", self.mcp_config])
+        mcp_config = self._build_mcp_config()
+        if mcp_config:
+            cmd.extend(["--mcp-config", mcp_config])
 
         if self._session_id:
             cmd.extend(["--resume", self._session_id])
@@ -499,7 +694,13 @@ class Claude:
         )
 
     async def _init_handshake(self) -> InitEvent:
-        """Perform the init handshake and return capabilities."""
+        """Perform the init handshake and return capabilities.
+
+        During init, claude sends MCP setup messages (initialize,
+        notifications/initialized, tools/list) for each SDK server.
+        We dispatch those to our in-process servers while waiting
+        for the actual init response.
+        """
         await self._send_json(self._format_init_request())
 
         while True:
@@ -508,6 +709,11 @@ class Claude:
                 raise RuntimeError("claude exited during init handshake")
 
             event = self._parse_event(raw)
+
+            if isinstance(event, _ControlRequestEvent):
+                await self._handle_control_request(event)
+                continue
+
             if isinstance(event, InitEvent):
                 return event
 
