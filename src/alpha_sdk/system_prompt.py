@@ -63,14 +63,6 @@ def _load_bill_of_rights(identity_dir: Path) -> str:
     return ""
 
 
-async def _load_here() -> str:
-    """Load the 'here' context: client name, weather, hostname.
-
-    TODO: Build this out. For now, returns empty.
-    """
-    return ""
-
-
 async def _load_capsules() -> str:
     """Load yesterday's capsules (what happened yesterday, last night).
 
@@ -90,7 +82,11 @@ async def _load_letter() -> str:
 # -- Public API ---------------------------------------------------------------
 
 
-async def assemble_system_prompt(identity_dir: str | Path | None = None) -> str:
+async def assemble_system_prompt(
+    identity_dir: str | Path | None = None,
+    *,
+    here: str | None = None,
+) -> str:
     """Assemble the full system prompt from identity documents and context.
 
     Reads from the identity directory pointed to by JE_NE_SAIS_QUOI
@@ -100,6 +96,8 @@ async def assemble_system_prompt(identity_dir: str | Path | None = None) -> str:
     Args:
         identity_dir: Path to the identity directory. If None, reads
                       from $JE_NE_SAIS_QUOI environment variable.
+        here: Client context string, owned by the consumer.
+              E.g. "You are in Alpha-App, Alpha's sovereign chat application."
 
     Returns:
         The assembled system prompt as a single string.
@@ -120,8 +118,7 @@ async def assemble_system_prompt(identity_dir: str | Path | None = None) -> str:
     if bill:
         parts.append(bill)
 
-    # 3. Here — runtime context (TODO)
-    here = await _load_here()
+    # 3. Here — runtime context, provided by the consumer
     if here:
         parts.append(here)
 
