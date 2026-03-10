@@ -13,6 +13,7 @@ from .claude import (
     StreamEvent,
     SystemEvent,
     UserEvent,
+    replay_session,
 )
 from .system_prompt import assemble_system_prompt, read_soul
 
@@ -29,6 +30,8 @@ __all__ = [
     "SystemEvent",
     "ErrorEvent",
     "StreamEvent",
+    # Replay
+    "replay_session",
     # System prompt
     "assemble_system_prompt",
     "read_soul",

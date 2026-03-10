@@ -183,6 +183,56 @@ class _ControlRequestEvent(Event):
     request: dict = field(default_factory=dict)
 
 
+# -- Replay -------------------------------------------------------------------
+
+
+def _find_session_path(session_id: str, sessions_dir: Path | None = None) -> Path:
+    """Locate a session's JSONL transcript file."""
+    if sessions_dir:
+        path = sessions_dir / f"{session_id}.jsonl"
+    else:
+        # Default: ~/.claude/projects/{cwd-with-dashes}/
+        cwd = os.path.realpath(os.getcwd()).replace("/", "-")
+        path = Path.home() / ".claude" / "projects" / cwd / f"{session_id}.jsonl"
+    if not path.exists():
+        raise FileNotFoundError(f"Session transcript not found: {path}")
+    return path
+
+
+async def replay_session(
+    session_id: str,
+    sessions_dir: Path | None = None,
+) -> AsyncIterator[Event]:
+    """Read a session's JSONL transcript and yield replay events.
+
+    Yields UserEvent and AssistantEvent with is_replay=True.
+    No StreamEvents (those are real-time only), no control events.
+    Skips queue-operation and system records.
+    """
+    path = _find_session_path(session_id, sessions_dir)
+
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        record_type = record.get("type")
+        message = record.get("message", {})
+        content = message.get("content", [])
+
+        if record_type == "user":
+            # Normalize content to list of blocks
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}]
+            yield UserEvent(raw=record, content=content, is_replay=True)
+        elif record_type == "assistant":
+            if isinstance(content, list):
+                yield AssistantEvent(raw=record, content=content, is_replay=True)
+
+
 # -- Claude -------------------------------------------------------------------
 
 
